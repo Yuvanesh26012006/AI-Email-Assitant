@@ -23,6 +23,7 @@ try:
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
     GOOGLE_AVAILABLE = True
+    GOOGLE_IMPORT_ERROR = ""
 except ImportError as e:
     GOOGLE_AVAILABLE = False
     GOOGLE_IMPORT_ERROR = str(e)
@@ -183,6 +184,10 @@ class GmailService:
 
     def authenticate(self) -> bool:
         try:
+            if not GOOGLE_AVAILABLE:
+                self.last_error = f"Google libraries not installed. Check requirements.txt. Detail: {GOOGLE_IMPORT_ERROR}"
+                return False
+
             creds_file, token_file = _prepare_credential_files()
 
             # ── Load token ────────────────────────────────────
@@ -340,6 +345,10 @@ class CalendarService:
 
     def authenticate(self) -> bool:
         try:
+            if not GOOGLE_AVAILABLE:
+                self.last_error = f"Google libraries not installed. Check requirements.txt. Detail: {GOOGLE_IMPORT_ERROR}"
+                return False
+
             creds_file, token_file = _prepare_credential_files()
 
             if not os.path.exists(token_file):

@@ -106,34 +106,34 @@ def _get_client_config() -> dict:
     }
 
 
+def _generate_code_verifier() -> str:
+    """Generate a cryptographically random PKCE code_verifier (43-128 chars)."""
+    import secrets
+    return secrets.token_urlsafe(96)  # 128 URL-safe chars
+
+
 def get_oauth_flow(state: Optional[str] = None) -> Flow:
-    """
-    Return a configured Flow.
-    Pass `state` when reconstructing the flow for token exchange so that
-    oauthlib's state-mismatch check passes across Streamlit reruns.
-    """
-    flow = Flow.from_client_config(
+    """Return a configured Flow, optionally restoring a previous state."""
+    return Flow.from_client_config(
         _get_client_config(),
         scopes=SCOPES,
         redirect_uri=REDIRECT_URI,
         state=state,
     )
-    return flow
 
 
 def handle_google_auth() -> Optional[Credentials]:
     """
     Browser-based OAuth for Streamlit Cloud.
 
-    Problems solved vs. naive approach:
-    - State mismatch: each Streamlit rerun creates a fresh Flow with a new
-      random `state`. We save the original state to session_state and
-      reconstruct the flow with it on the callback rerun.
-    - PKCE (code_verifier): we disable it entirely — it is not required for
-      server-side web-app flows and causes 'invalid_grant' when the verifier
-      is lost across reruns.
-    - Redirect URI: we reconstruct the full callback URL so oauthlib can
-      validate it rather than passing just the bare code.
+    Key design decisions:
+    - We explicitly generate the code_verifier OURSELVES and save it to
+      session_state. This is the only reliable way to survive the Streamlit
+      rerun that happens when Google redirects back with ?code=.
+    - We save `state` to session_state and reconstruct the Flow with the same
+      state on the callback rerun, so oauthlib's state check passes.
+    - We pass authorization_response (full URL) to fetch_token which is more
+      robust than passing just the code.
     """
     from urllib.parse import urlencode
 
@@ -154,19 +154,21 @@ def handle_google_auth() -> Optional[Credentials]:
     params = dict(st.query_params)
     if "code" in params:
         try:
-            # Reconstruct the full callback URL exactly as Google sent it.
-            # oauthlib needs this to validate state & redirect_uri.
-            callback_url = f"{REDIRECT_URI}?{urlencode(params)}"
+            callback_url   = f"{REDIRECT_URI}?{urlencode(params)}"
+            saved_state    = st.session_state.pop("oauth_state",         None)
+            code_verifier  = st.session_state.pop("oauth_code_verifier", None)
 
-            # Rebuild the flow with the SAME state that was used when we
-            # generated the auth URL, so oauthlib's state check passes.
-            saved_state = st.session_state.pop("oauth_state", None)
             flow = get_oauth_flow(state=saved_state)
 
-            # Disable PKCE: we never set a code_verifier, so don't send one.
-            # Passing authorization_response (full URL) is the most robust path.
-            os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "0")
-            flow.fetch_token(authorization_response=callback_url)
+            # Pass the code_verifier we saved before the redirect.
+            # Google requires it because we sent a code_challenge in the
+            # auth URL — if we don't send the verifier back we get
+            # "Missing code verifier".
+            fetch_kwargs = {"authorization_response": callback_url}
+            if code_verifier:
+                fetch_kwargs["code_verifier"] = code_verifier
+
+            flow.fetch_token(**fetch_kwargs)
 
             creds = flow.credentials
             _save_creds_to_session(creds)
@@ -174,23 +176,30 @@ def handle_google_auth() -> Optional[Credentials]:
             st.rerun()
         except Exception as e:
             st.error(f"OAuth token exchange failed: {e}")
-            st.session_state.pop("oauth_state", None)
-            st.button("Try signing in again", on_click=lambda: None)
+            # Wipe stale session keys so the user can start fresh
+            for k in ("oauth_state", "oauth_code_verifier"):
+                st.session_state.pop(k, None)
+            if st.button("🔄 Try again"):
+                st.rerun()
         return None
 
     # ── Not authenticated yet — show login UI ────────────────────────────────
-    flow = get_oauth_flow()
+    # Generate our OWN code_verifier before creating the flow so we control
+    # it completely. Pass it to authorization_url() so the library builds the
+    # matching code_challenge from it.
+    code_verifier = _generate_code_verifier()
 
-    # Generate auth URL WITHOUT PKCE (do not pass code_challenge params).
-    # access_type=offline gives us a refresh_token.
+    flow = get_oauth_flow()
     auth_url, state = flow.authorization_url(
         prompt="consent",
         access_type="offline",
         include_granted_scopes="true",
+        code_verifier=code_verifier,   # ← tells oauthlib to add code_challenge
     )
 
-    # Save state so we can reconstruct the flow identically on the callback.
-    st.session_state["oauth_state"] = state
+    # Persist both state and verifier so the callback rerun can find them
+    st.session_state["oauth_state"]         = state
+    st.session_state["oauth_code_verifier"] = code_verifier
 
     st.markdown(
         """

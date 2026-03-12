@@ -1,7 +1,7 @@
 """
-Ambient Email Assistant - Enhanced Version
-AI-powered email and calendar management with LangGraph workflows
-Compatible with Streamlit Cloud (browser-based OAuth, no credentials.json needed)
+Ambient Email Assistant
+AI-powered email and calendar management.
+Streamlit Cloud compatible — browser OAuth via direct HTTP, no PKCE.
 """
 
 import os
@@ -12,220 +12,125 @@ from typing import List, Dict, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from email.mime.text import MIMEText
 import re
+import requests as _requests
 
-# Streamlit
 import streamlit as st
 
-# Google API imports
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# LangChain imports
 try:
     from langchain_openai import ChatOpenAI
     from langchain.prompts import ChatPromptTemplate
-    from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
     LANGCHAIN_AVAILABLE = True
 except ImportError:
     LANGCHAIN_AVAILABLE = False
-    print("Warning: LangChain not available. AI features will be disabled.")
 
-# LangGraph imports
 try:
     from langgraph.graph import StateGraph, END
-    from langgraph.checkpoint.sqlite import SqliteSaver
     LANGGRAPH_AVAILABLE = True
 except ImportError:
     LANGGRAPH_AVAILABLE = False
-    print("Warning: LangGraph not available. Workflow features will be limited.")
 
-# Environment variables
 from dotenv import load_dotenv
 load_dotenv()
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
 
 SCOPES = [
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/gmail.send',
-    'https://www.googleapis.com/auth/gmail.compose',
-    'https://www.googleapis.com/auth/gmail.modify',
-    'https://www.googleapis.com/auth/calendar.readonly',
-    'https://www.googleapis.com/auth/calendar.events'
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
 ]
 
-# Streamlit Cloud app URL — used as the OAuth redirect URI
-APP_URL = "https://inboxai.streamlit.app"
-REDIRECT_URI = APP_URL  # Google will redirect here after user grants access
+APP_URL      = "https://inboxai.streamlit.app"
+REDIRECT_URI = APP_URL
 
-MEMORY_DIR = 'memory'
-MEMORY_FILE = os.path.join(MEMORY_DIR, 'conversation_memory.pkl')
+MEMORY_DIR  = "memory"
+MEMORY_FILE = os.path.join(MEMORY_DIR, "conversation_memory.pkl")
 
+# ---------------------------------------------------------------------------
+# OAUTH — pure requests, zero oauthlib, zero PKCE
+# ---------------------------------------------------------------------------
 
-# ============================================================================
-# OAUTH HELPERS (Streamlit Cloud — no credentials.json, no local server)
-# ============================================================================
-
-def _get_client_config() -> dict:
-    """
-    Build the OAuth client config dict from Streamlit secrets.
-    Falls back to environment variables so local dev still works.
-
-    Expected Streamlit secret keys (under [google_credentials]):
-        client_id, client_secret
-    """
+def _google_creds() -> dict:
+    """Read client_id / client_secret from Streamlit secrets or env vars."""
     try:
-        client_id     = st.secrets["google_credentials"]["client_id"]
-        client_secret = st.secrets["google_credentials"]["client_secret"]
+        cid = st.secrets["google_credentials"]["client_id"]
+        csecret = st.secrets["google_credentials"]["client_secret"]
     except (KeyError, FileNotFoundError):
-        # Fallback: env vars (useful for local testing with a .env file)
-        client_id     = os.getenv("GOOGLE_CLIENT_ID", "")
-        client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
-
-    if not client_id or not client_secret:
-        st.error(
-            "❌ Google OAuth credentials not found.  \n"
-            "Add `client_id` and `client_secret` under `[google_credentials]` "
-            "in your Streamlit Cloud secrets."
-        )
+        cid     = os.getenv("GOOGLE_CLIENT_ID", "")
+        csecret = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    if not cid or not csecret:
+        st.error("Google credentials not found in Streamlit secrets.")
         st.stop()
-
     return {
-        "web": {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "redirect_uris": [REDIRECT_URI],
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-        }
+        "client_id":     cid,
+        "client_secret": csecret,
+        "auth_uri":      "https://accounts.google.com/o/oauth2/auth",
+        "token_uri":     "https://oauth2.googleapis.com/token",
     }
 
 
-def _generate_code_verifier() -> str:
-    """Generate a cryptographically random PKCE code_verifier (43-128 chars)."""
-    import secrets
-    return secrets.token_urlsafe(96)  # 128 URL-safe chars
-
-
-def get_oauth_flow(state: Optional[str] = None) -> Flow:
-    """Return a configured Flow, optionally restoring a previous state."""
-    return Flow.from_client_config(
-        _get_client_config(),
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-        state=state,
-    )
-
-
-def handle_google_auth() -> Optional[Credentials]:
-    """
-    Browser-based OAuth for Streamlit Cloud.
-
-    Key design decisions:
-    - We explicitly generate the code_verifier OURSELVES and save it to
-      session_state. This is the only reliable way to survive the Streamlit
-      rerun that happens when Google redirects back with ?code=.
-    - We save `state` to session_state and reconstruct the Flow with the same
-      state on the callback rerun, so oauthlib's state check passes.
-    - We pass authorization_response (full URL) to fetch_token which is more
-      robust than passing just the code.
-    """
+def _build_auth_url() -> str:
+    """Construct the Google consent-screen URL manually (no oauthlib)."""
     from urllib.parse import urlencode
+    c = _google_creds()
+    p = {
+        "client_id":     c["client_id"],
+        "redirect_uri":  REDIRECT_URI,
+        "response_type": "code",
+        "scope":         " ".join(SCOPES),
+        "access_type":   "offline",
+        "prompt":        "consent",
+    }
+    return c["auth_uri"] + "?" + urlencode(p)
 
-    # ── Already authenticated in this session? ──────────────────────────────
-    if "google_creds_token" in st.session_state:
-        creds = _creds_from_session()
-        if creds and creds.valid:
-            return creds
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-                _save_creds_to_session(creds)
-                return creds
-            except Exception:
-                pass  # fall through to re-auth
 
-    # ── Returning from Google with ?code= in the URL ─────────────────────────
-    params = dict(st.query_params)
-    if "code" in params:
-        try:
-            callback_url   = f"{REDIRECT_URI}?{urlencode(params)}"
-            saved_state    = st.session_state.pop("oauth_state",         None)
-            code_verifier  = st.session_state.pop("oauth_code_verifier", None)
-
-            flow = get_oauth_flow(state=saved_state)
-
-            # Pass the code_verifier we saved before the redirect.
-            # Google requires it because we sent a code_challenge in the
-            # auth URL — if we don't send the verifier back we get
-            # "Missing code verifier".
-            fetch_kwargs = {"authorization_response": callback_url}
-            if code_verifier:
-                fetch_kwargs["code_verifier"] = code_verifier
-
-            flow.fetch_token(**fetch_kwargs)
-
-            creds = flow.credentials
-            _save_creds_to_session(creds)
-            st.query_params.clear()
-            st.rerun()
-        except Exception as e:
-            st.error(f"OAuth token exchange failed: {e}")
-            # Wipe stale session keys so the user can start fresh
-            for k in ("oauth_state", "oauth_code_verifier"):
-                st.session_state.pop(k, None)
-            if st.button("🔄 Try again"):
-                st.rerun()
-        return None
-
-    # ── Not authenticated yet — show login UI ────────────────────────────────
-    # Generate our OWN code_verifier before creating the flow so we control
-    # it completely. Pass it to authorization_url() so the library builds the
-    # matching code_challenge from it.
-    code_verifier = _generate_code_verifier()
-
-    flow = get_oauth_flow()
-    auth_url, state = flow.authorization_url(
-        prompt="consent",
-        access_type="offline",
-        include_granted_scopes="true",
-        code_verifier=code_verifier,   # ← tells oauthlib to add code_challenge
+def _exchange_code(code: str) -> Credentials:
+    """
+    POST the authorization code straight to Google's token endpoint.
+    No oauthlib, no PKCE, no state — nothing that can be lost across reruns.
+    """
+    c    = _google_creds()
+    resp = _requests.post(
+        c["token_uri"],
+        data={
+            "code":          code,
+            "client_id":     c["client_id"],
+            "client_secret": c["client_secret"],
+            "redirect_uri":  REDIRECT_URI,
+            "grant_type":    "authorization_code",
+        },
+        timeout=15,
+    )
+    body = resp.json()
+    if not resp.ok or "error" in body:
+        raise RuntimeError(
+            f"{body.get('error', resp.status_code)}: "
+            f"{body.get('error_description', resp.text)}"
+        )
+    expiry = datetime.utcnow() + timedelta(seconds=int(body.get("expires_in", 3600)))
+    return Credentials(
+        token=body["access_token"],
+        refresh_token=body.get("refresh_token"),
+        token_uri=c["token_uri"],
+        client_id=c["client_id"],
+        client_secret=c["client_secret"],
+        scopes=body.get("scope", " ".join(SCOPES)).split(),
+        expiry=expiry,
     )
 
-    # Persist both state and verifier so the callback rerun can find them
-    st.session_state["oauth_state"]         = state
-    st.session_state["oauth_code_verifier"] = code_verifier
 
-    st.markdown(
-        """
-        <div style='text-align:center; padding: 60px 20px;'>
-            <h1>📬 Ambient Email Assistant</h1>
-            <p style='font-size:18px; color:#555;'>
-                Connect your Google account to get started.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    col1, col2, col3 = st.columns([2, 1, 2])
-    with col2:
-        st.link_button("🔐 Sign in with Google", auth_url, use_container_width=True)
-
-    st.info(
-        "This app uses read/write access to Gmail and Google Calendar "
-        "to analyse emails, detect scheduling conflicts, and draft replies."
-    )
-    return None
-
-
-def _save_creds_to_session(creds: Credentials):
-    """Persist credentials fields (JSON-serialisable) in session_state."""
-    st.session_state["google_creds_token"] = {
+def _save_creds(creds: Credentials):
+    st.session_state["_gcreds"] = {
         "token":         creds.token,
         "refresh_token": creds.refresh_token,
         "token_uri":     creds.token_uri,
@@ -236,30 +141,91 @@ def _save_creds_to_session(creds: Credentials):
     }
 
 
-def _creds_from_session() -> Optional[Credentials]:
-    """Re-hydrate a Credentials object from session_state."""
-    data = st.session_state.get("google_creds_token")
-    if not data:
+def _load_creds() -> Optional[Credentials]:
+    d = st.session_state.get("_gcreds")
+    if not d:
         return None
-    expiry = datetime.fromisoformat(data["expiry"]) if data.get("expiry") else None
+    expiry = datetime.fromisoformat(d["expiry"]) if d.get("expiry") else None
     return Credentials(
-        token=data["token"],
-        refresh_token=data["refresh_token"],
-        token_uri=data["token_uri"],
-        client_id=data["client_id"],
-        client_secret=data["client_secret"],
-        scopes=data["scopes"],
+        token=d["token"],
+        refresh_token=d["refresh_token"],
+        token_uri=d["token_uri"],
+        client_id=d["client_id"],
+        client_secret=d["client_secret"],
+        scopes=d["scopes"],
         expiry=expiry,
     )
 
 
-# ============================================================================
+def handle_google_auth() -> Optional[Credentials]:
+    """
+    Full OAuth flow for Streamlit Cloud.
+    Token exchange is done with a plain requests.post so PKCE / state /
+    code_verifier are never involved — nothing to lose across reruns.
+    """
+    # Already signed in?
+    if "_gcreds" in st.session_state:
+        creds = _load_creds()
+        if creds and creds.valid:
+            return creds
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                _save_creds(creds)
+                return creds
+            except Exception:
+                st.session_state.pop("_gcreds", None)
+
+    # Callback from Google?
+    params = dict(st.query_params)
+
+    if "error" in params:
+        st.error(f"Google sign-in error: {params['error']}")
+        st.query_params.clear()
+        return None
+
+    if "code" in params:
+        code = params["code"]
+        # clear URL immediately so a page-refresh doesn't reuse the code
+        st.query_params.clear()
+        try:
+            with st.spinner("Completing sign-in…"):
+                creds = _exchange_code(code)
+            _save_creds(creds)
+            st.rerun()
+        except Exception as e:
+            st.error(f"Sign-in failed: {e}")
+        return None
+
+    # Show sign-in button
+    auth_url = _build_auth_url()
+    st.markdown(
+        """
+        <div style='text-align:center;padding:60px 20px'>
+          <h1>📬 Ambient Email Assistant</h1>
+          <p style='font-size:18px;color:#555'>
+            Connect your Google account to get started.
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    c1, c2, c3 = st.columns([2, 1, 2])
+    with c2:
+        st.link_button("🔐 Sign in with Google", auth_url, use_container_width=True)
+    st.info(
+        "This app requires Gmail and Google Calendar access to analyse "
+        "emails, detect scheduling conflicts, and draft replies."
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # DATA MODELS
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 @dataclass
 class EmailData:
-    """Email data model"""
     id: str
     thread_id: str
     subject: str
@@ -274,8 +240,6 @@ class EmailData:
     has_calendar_event: bool = False
     sender_email: str = ""
     labels: List[str] = field(default_factory=list)
-
-    # AI-enhanced fields
     category: Optional[str] = None
     priority_score: Optional[int] = None
     sentiment: Optional[str] = None
@@ -283,12 +247,11 @@ class EmailData:
     action_items: List[str] = field(default_factory=list)
 
     def __str__(self):
-        return f"Email(subject='{self.subject}', from='{self.sender}', date={self.timestamp})"
+        return f"Email(subject='{self.subject}', from='{self.sender}')"
 
 
 @dataclass
 class CalendarEvent:
-    """Calendar event data model"""
     id: str
     summary: str
     start_time: datetime
@@ -303,9 +266,9 @@ class CalendarEvent:
     title: str = field(init=False, repr=False)
 
     def __post_init__(self):
-        object.__setattr__(self, 'start', self.start_time)
-        object.__setattr__(self, 'end', self.end_time)
-        object.__setattr__(self, 'title', self.summary)
+        object.__setattr__(self, "start", self.start_time)
+        object.__setattr__(self, "end",   self.end_time)
+        object.__setattr__(self, "title", self.summary)
 
     @property
     def duration_minutes(self) -> int:
@@ -317,7 +280,6 @@ class CalendarEvent:
 
 @dataclass
 class ConflictInfo:
-    """Calendar conflict information"""
     event1: CalendarEvent
     event2: CalendarEvent
     overlap_start: datetime
@@ -331,27 +293,25 @@ class ConflictInfo:
         return int((self.overlap_end - self.overlap_start).total_seconds() / 60)
 
     def __str__(self):
-        return f"Conflict: '{self.event1.summary}' vs '{self.event2.summary}' ({self.overlap_minutes} min)"
+        return (
+            f"Conflict: '{self.event1.summary}' vs '{self.event2.summary}' "
+            f"({self.overlap_minutes} min)"
+        )
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # GMAIL SERVICE
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 class GmailService:
-    """Gmail API service wrapper"""
-
     def __init__(self):
         self.service = None
-        self.creds = None
 
     def inject_credentials(self, creds: Credentials) -> bool:
-        """Receive credentials from browser OAuth — no file I/O."""
         try:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
-            self.creds = creds
-            self.service = build('gmail', 'v1', credentials=self.creds)
+            self.service = build("gmail", "v1", credentials=creds)
             return True
         except Exception as e:
             print(f"GmailService.inject_credentials: {e}")
@@ -361,55 +321,50 @@ class GmailService:
         if not self.service:
             return []
         try:
-            results = self.service.users().messages().list(
-                userId='me', q=query, maxResults=max_results
+            results  = self.service.users().messages().list(
+                userId="me", q=query, maxResults=max_results
             ).execute()
-            messages = results.get('messages', [])
-            emails = []
-            for msg in messages:
-                email = self._parse_message(msg['id'])
-                if email:
-                    emails.append(email)
-            return emails
-        except HttpError as error:
-            print(f'Gmail API error: {error}')
+            messages = results.get("messages", [])
+            return [e for e in (self._parse_message(m["id"]) for m in messages) if e]
+        except HttpError as e:
+            print(f"Gmail API error: {e}")
             return []
 
     def _parse_message(self, msg_id: str) -> Optional[EmailData]:
         try:
-            message = self.service.users().messages().get(
-                userId='me', id=msg_id, format='full'
+            msg     = self.service.users().messages().get(
+                userId="me", id=msg_id, format="full"
             ).execute()
+            headers = msg["payload"]["headers"]
 
-            headers = message['payload']['headers']
-            subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
-            sender  = next((h['value'] for h in headers if h['name'].lower() == 'from'),    'Unknown')
-            recipient = next((h['value'] for h in headers if h['name'].lower() == 'to'),    'Unknown')
-            date_str  = next((h['value'] for h in headers if h['name'].lower() == 'date'),  None)
+            def hdr(name):
+                return next(
+                    (h["value"] for h in headers if h["name"].lower() == name), ""
+                )
 
-            sender_email = self._extract_email_address(sender)
-            timestamp    = self._parse_date(date_str) if date_str else datetime.now()
-            body         = self._get_message_body(message)
-            snippet      = message.get('snippet', '')
-            labels       = message.get('labelIds', [])
-            is_unread    = 'UNREAD' in labels
-            is_important = 'IMPORTANT' in labels or 'STARRED' in labels
-            has_attachment    = self._has_attachments(message)
-            has_calendar_event = self._detect_calendar_event(body, subject)
+            subject  = hdr("subject") or "No Subject"
+            sender   = hdr("from")    or "Unknown"
+            recipient= hdr("to")      or "Unknown"
+            date_str = hdr("date")
+            sender_email = self._extract_email(sender)
+            timestamp    = self._parse_date(date_str)
+            body         = self._get_body(msg)
+            snippet      = msg.get("snippet", "")
+            labels       = msg.get("labelIds", [])
 
             return EmailData(
                 id=msg_id,
-                thread_id=message['threadId'],
+                thread_id=msg["threadId"],
                 subject=subject,
                 sender=sender,
                 recipient=recipient,
                 timestamp=timestamp,
                 body=body,
                 snippet=snippet,
-                is_unread=is_unread,
-                is_important=is_important,
-                has_attachment=has_attachment,
-                has_calendar_event=has_calendar_event,
+                is_unread    ="UNREAD"    in labels,
+                is_important ="IMPORTANT" in labels or "STARRED" in labels,
+                has_attachment=self._has_attachments(msg),
+                has_calendar_event=self._has_calendar(body, subject),
                 sender_email=sender_email,
                 labels=labels,
             )
@@ -417,51 +372,43 @@ class GmailService:
             print(f"Error parsing message {msg_id}: {e}")
             return None
 
-    def _detect_calendar_event(self, body: str, subject: str) -> bool:
-        keywords = [
-            'meeting', 'calendar', 'event', 'invited', 'invitation',
-            'scheduled', 'appointment', 'conference', 'zoom', 'teams',
-            'when:', 'where:', 'time:', 'date:', 'rsvp',
-        ]
-        body_lower    = body.lower()
-        subject_lower = subject.lower()
-        return any(kw in body_lower or kw in subject_lower for kw in keywords)
+    def _extract_email(self, s: str) -> str:
+        m = re.search(r"<([^>]+)>", s)
+        if m:
+            return m.group(1)
+        m = re.search(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", s)
+        return m.group(0) if m else s
 
-    def _extract_email_address(self, sender: str) -> str:
-        match = re.search(r'<([^>]+)>', sender)
-        if match:
-            return match.group(1)
-        match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', sender)
-        if match:
-            return match.group(0)
-        return sender
+    def _has_calendar(self, body: str, subject: str) -> bool:
+        kws = ["meeting","calendar","event","invited","invitation","scheduled",
+               "appointment","conference","zoom","teams","when:","where:","rsvp"]
+        b, s = body.lower(), subject.lower()
+        return any(k in b or k in s for k in kws)
 
-    def _get_message_body(self, message: Dict) -> str:
+    def _get_body(self, message: dict) -> str:
         try:
-            parts = message['payload'].get('parts', [])
+            parts = message["payload"].get("parts", [])
             if not parts:
-                body_data = message['payload'].get('body', {}).get('data', '')
-                if body_data:
-                    return base64.urlsafe_b64decode(body_data).decode('utf-8', errors='ignore')
+                data = message["payload"].get("body", {}).get("data", "")
+                if data:
+                    return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
             for part in parts:
-                if part['mimeType'] == 'text/plain':
-                    body_data = part.get('body', {}).get('data', '')
-                    if body_data:
-                        return base64.urlsafe_b64decode(body_data).decode('utf-8', errors='ignore')
+                if part["mimeType"] == "text/plain":
+                    data = part.get("body", {}).get("data", "")
+                    if data:
+                        return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
             for part in parts:
-                if part['mimeType'] == 'text/html':
-                    body_data = part.get('body', {}).get('data', '')
-                    if body_data:
-                        html = base64.urlsafe_b64decode(body_data).decode('utf-8', errors='ignore')
-                        return re.sub('<[^<]+?>', '', html)
-            return message.get('snippet', '')
-        except Exception as e:
-            print(f"Error extracting body: {e}")
-            return message.get('snippet', '')
+                if part["mimeType"] == "text/html":
+                    data = part.get("body", {}).get("data", "")
+                    if data:
+                        html = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                        return re.sub("<[^<]+?>", "", html)
+            return message.get("snippet", "")
+        except Exception:
+            return message.get("snippet", "")
 
-    def _has_attachments(self, message: Dict) -> bool:
-        parts = message['payload'].get('parts', [])
-        return any(part.get('filename') for part in parts)
+    def _has_attachments(self, message: dict) -> bool:
+        return any(p.get("filename") for p in message["payload"].get("parts", []))
 
     def _parse_date(self, date_str: str) -> datetime:
         try:
@@ -475,55 +422,49 @@ class GmailService:
         if not self.service:
             return False
         try:
-            message = MIMEText(body)
-            message['to'] = to
-            message['subject'] = subject
-            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
-            send_message = {'raw': raw_message}
+            msg = MIMEText(body)
+            msg["to"]      = to
+            msg["subject"] = subject
+            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+            payload = {"raw": raw}
             if thread_id:
-                send_message['threadId'] = thread_id
-            self.service.users().messages().send(userId='me', body=send_message).execute()
+                payload["threadId"] = thread_id
+            self.service.users().messages().send(userId="me", body=payload).execute()
             return True
-        except HttpError as error:
-            print(f'Error sending email: {error}')
+        except HttpError as e:
+            print(f"Error sending email: {e}")
             return False
 
     def create_draft(self, to: str, subject: str, body: str) -> bool:
         if not self.service:
             return False
         try:
-            message = MIMEText(body)
-            message['to'] = to
-            message['subject'] = subject
-            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+            msg = MIMEText(body)
+            msg["to"]      = to
+            msg["subject"] = subject
+            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
             self.service.users().drafts().create(
-                userId='me',
-                body={'message': {'raw': raw_message}}
+                userId="me", body={"message": {"raw": raw}}
             ).execute()
             return True
-        except HttpError as error:
-            print(f'Error creating draft: {error}')
+        except HttpError as e:
+            print(f"Error creating draft: {e}")
             return False
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # CALENDAR SERVICE
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 class CalendarService:
-    """Google Calendar API service wrapper"""
-
     def __init__(self):
         self.service = None
-        self.creds = None
 
     def inject_credentials(self, creds: Credentials) -> bool:
-        """Receive credentials from browser OAuth — no file I/O."""
         try:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
-            self.creds = creds
-            self.service = build('calendar', 'v3', credentials=self.creds)
+            self.service = build("calendar", "v3", credentials=creds)
             return True
         except Exception as e:
             print(f"CalendarService.inject_credentials: {e}")
@@ -534,38 +475,33 @@ class CalendarService:
             return []
         try:
             now      = datetime.utcnow()
-            time_min = now.isoformat() + 'Z'
-            time_max = (now + timedelta(days=days_ahead)).isoformat() + 'Z'
             result   = self.service.events().list(
-                calendarId='primary',
-                timeMin=time_min,
-                timeMax=time_max,
+                calendarId="primary",
+                timeMin=now.isoformat() + "Z",
+                timeMax=(now + timedelta(days=days_ahead)).isoformat() + "Z",
                 maxResults=100,
                 singleEvents=True,
-                orderBy='startTime',
+                orderBy="startTime",
             ).execute()
-            return [e for e in (self._parse_event(ev) for ev in result.get('items', [])) if e]
-        except HttpError as error:
-            print(f'Calendar API error: {error}')
+            return [e for e in (self._parse_event(ev) for ev in result.get("items", [])) if e]
+        except HttpError as e:
+            print(f"Calendar API error: {e}")
             return []
 
-    def _parse_event(self, event: Dict) -> Optional[CalendarEvent]:
+    def _parse_event(self, event: dict) -> Optional[CalendarEvent]:
         try:
-            start = event['start'].get('dateTime', event['start'].get('date'))
-            end   = event['end'].get('dateTime',   event['end'].get('date'))
-            start_time = datetime.fromisoformat(start.replace('Z', '+00:00'))
-            end_time   = datetime.fromisoformat(end.replace('Z',   '+00:00'))
-            attendees  = [a.get('email', '') for a in event.get('attendees', [])]
+            start = event["start"].get("dateTime", event["start"].get("date"))
+            end   = event["end"].get("dateTime",   event["end"].get("date"))
             return CalendarEvent(
-                id=event['id'],
-                summary=event.get('summary', 'No Title'),
-                start_time=start_time,
-                end_time=end_time,
-                description=event.get('description'),
-                location=event.get('location'),
-                attendees=attendees,
-                organizer=event.get('organizer', {}).get('email'),
-                status=event.get('status', 'confirmed'),
+                id=event["id"],
+                summary=event.get("summary", "No Title"),
+                start_time=datetime.fromisoformat(start.replace("Z", "+00:00")),
+                end_time  =datetime.fromisoformat(end.replace("Z",   "+00:00")),
+                description=event.get("description"),
+                location   =event.get("location"),
+                attendees  =[a.get("email", "") for a in event.get("attendees", [])],
+                organizer  =event.get("organizer", {}).get("email"),
+                status     =event.get("status", "confirmed"),
             )
         except Exception as e:
             print(f"Error parsing event: {e}")
@@ -577,10 +513,9 @@ class CalendarService:
             for e2 in events[i + 1:]:
                 if e1.start_time < e2.end_time and e2.start_time < e1.end_time:
                     conflicts.append(ConflictInfo(
-                        event1=e1,
-                        event2=e2,
+                        event1=e1, event2=e2,
                         overlap_start=max(e1.start_time, e2.start_time),
-                        overlap_end=min(e1.end_time, e2.end_time),
+                        overlap_end  =min(e1.end_time,   e2.end_time),
                     ))
         return conflicts
 
@@ -592,54 +527,42 @@ class CalendarService:
             now        = datetime.now()
             search_end = now + timedelta(days=days_ahead)
 
-            # Build a list of (start, end) tuples for blocking
-            future_events = []
+            future = []
             for ev in (events or []):
                 s = ev.start_time.replace(tzinfo=None) if ev.start_time.tzinfo else ev.start_time
                 e = ev.end_time.replace(tzinfo=None)   if ev.end_time.tzinfo   else ev.end_time
                 if e > now and s < search_end:
-                    future_events.append((s, e))
+                    future.append((s, e))
 
-            # Start scanning from the next 30-min boundary inside business hours
             if now.hour >= 20:
-                current = (now + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+                cur = (now + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
             elif now.hour < 8:
-                current = now.replace(hour=8, minute=0, second=0, microsecond=0)
+                cur = now.replace(hour=8, minute=0, second=0, microsecond=0)
             else:
                 mins = (now.minute // 30 + 1) * 30
                 if mins >= 60:
-                    current = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+                    cur = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
                 else:
-                    current = now.replace(minute=mins, second=0, microsecond=0)
+                    cur = now.replace(minute=mins, second=0, microsecond=0)
 
-            iterations = 0
-            while current < search_end and iterations < 1000:
-                iterations += 1
-                slot_end = current + timedelta(minutes=duration_minutes)
+            iters = 0
+            while cur < search_end and iters < 1000:
+                iters += 1
+                slot_end = cur + timedelta(minutes=duration_minutes)
 
-                if current.hour < 8:
-                    current = current.replace(hour=8, minute=0, second=0, microsecond=0)
+                if cur.hour < 8:
+                    cur = cur.replace(hour=8, minute=0, second=0, microsecond=0)
                     continue
-                if current.hour >= 20:
-                    current = (current + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+                if cur.hour >= 20:
+                    cur = (cur + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
                     continue
 
-                is_free = all(
-                    not (current < ev_end and slot_end > ev_start)
-                    for ev_start, ev_end in future_events
-                )
-
-                if is_free and current > now:
-                    free_slots.append({
-                        'start': current,
-                        'end': slot_end,
-                        'duration_minutes': duration_minutes,
-                    })
-
+                is_free = all(not (cur < e and slot_end > s) for s, e in future)
+                if is_free and cur > now:
+                    free_slots.append({"start": cur, "end": slot_end, "duration_minutes": duration_minutes})
                 if len(free_slots) >= 20:
                     break
-
-                current += timedelta(minutes=30)
+                cur += timedelta(minutes=30)
 
             return free_slots
         except Exception as e:
@@ -647,290 +570,223 @@ class CalendarService:
             return []
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # AI ANALYZER
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 class AIAnalyzer:
-    """AI-powered email and calendar analysis"""
-
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv('OPENAI_API_KEY')
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.llm = None
         if LANGCHAIN_AVAILABLE and self.api_key:
             try:
                 self.llm = ChatOpenAI(
-                    model=os.getenv('LLM_MODEL', 'gpt-4'),
-                    temperature=float(os.getenv('LLM_TEMPERATURE', '0.7')),
+                    model=os.getenv("LLM_MODEL", "gpt-4"),
+                    temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")),
                     api_key=self.api_key,
                 )
             except Exception as e:
-                print(f"Error initializing LLM: {e}")
+                print(f"LLM init error: {e}")
 
     def analyze_email(self, email: EmailData) -> EmailData:
         if not self.llm:
-            return self._rule_based_analysis(email)
+            return self._rule_based(email)
         try:
             prompt = ChatPromptTemplate.from_messages([
-                ("system", """You are an email analysis assistant. Analyse the email and provide:
-1. Category (work, personal, urgent, spam, newsletter)
-2. Priority score (0-10, where 10 is most important)
-3. Sentiment (positive, neutral, negative)
-4. Extracted dates (if any)
-5. Action items (if any)
-
-Respond in this exact format:
-Category: <category>
-Priority: <score>
-Sentiment: <sentiment>
-Dates: <comma-separated dates or "none">
-Actions: <comma-separated actions or "none">
-"""),
+                ("system", """Analyse the email and respond ONLY in this format:
+Category: <work|personal|urgent|spam|newsletter>
+Priority: <0-10>
+Sentiment: <positive|neutral|negative>
+Dates: <comma-separated or none>
+Actions: <comma-separated or none>"""),
                 ("human", "Subject: {subject}\nFrom: {sender}\nBody: {body}"),
             ])
-            chain    = prompt | self.llm
-            response = chain.invoke({
+            resp = (prompt | self.llm).invoke({
                 "subject": email.subject,
                 "sender":  email.sender,
                 "body":    email.body[:1000],
             })
-            for line in response.content.strip().split('\n'):
-                if line.startswith('Category:'):
-                    email.category = line.split(':', 1)[1].strip().lower()
-                elif line.startswith('Priority:'):
-                    try:
-                        email.priority_score = int(line.split(':', 1)[1].strip())
-                    except Exception:
-                        email.priority_score = 5
-                elif line.startswith('Sentiment:'):
-                    email.sentiment = line.split(':', 1)[1].strip().lower()
-                elif line.startswith('Dates:'):
-                    dates = line.split(':', 1)[1].strip()
-                    if dates.lower() != 'none':
-                        email.extracted_dates = [d.strip() for d in dates.split(',')]
-                elif line.startswith('Actions:'):
-                    actions = line.split(':', 1)[1].strip()
-                    if actions.lower() != 'none':
-                        email.action_items = [a.strip() for a in actions.split(',')]
+            for line in resp.content.strip().split("\n"):
+                if line.startswith("Category:"):
+                    email.category = line.split(":", 1)[1].strip().lower()
+                elif line.startswith("Priority:"):
+                    try: email.priority_score = int(line.split(":", 1)[1].strip())
+                    except: email.priority_score = 5
+                elif line.startswith("Sentiment:"):
+                    email.sentiment = line.split(":", 1)[1].strip().lower()
+                elif line.startswith("Dates:"):
+                    v = line.split(":", 1)[1].strip()
+                    if v.lower() != "none":
+                        email.extracted_dates = [x.strip() for x in v.split(",")]
+                elif line.startswith("Actions:"):
+                    v = line.split(":", 1)[1].strip()
+                    if v.lower() != "none":
+                        email.action_items = [x.strip() for x in v.split(",")]
             return email
         except Exception as e:
             print(f"AI analysis error: {e}")
-            return self._rule_based_analysis(email)
+            return self._rule_based(email)
 
-    def _rule_based_analysis(self, email: EmailData) -> EmailData:
-        body_lower    = email.body.lower()
-        subject_lower = email.subject.lower()
-
-        if any(w in body_lower or w in subject_lower for w in ['meeting', 'project', 'deadline', 'task']):
-            email.category = 'work'
-        elif any(w in body_lower or w in subject_lower for w in ['urgent', 'asap', 'important', 'critical']):
-            email.category = 'urgent'
-        elif any(w in body_lower or w in subject_lower for w in ['unsubscribe', 'newsletter', 'promotion']):
-            email.category = 'newsletter'
+    def _rule_based(self, email: EmailData) -> EmailData:
+        b, s = email.body.lower(), email.subject.lower()
+        if any(w in b or w in s for w in ["meeting","project","deadline","task"]):
+            email.category = "work"
+        elif any(w in b or w in s for w in ["urgent","asap","critical"]):
+            email.category = "urgent"
+        elif any(w in b or w in s for w in ["unsubscribe","newsletter","promotion"]):
+            email.category = "newsletter"
         else:
-            email.category = 'personal'
+            email.category = "personal"
 
-        if email.is_important or email.category == 'urgent':
+        if email.is_important or email.category == "urgent":
             email.priority_score = 9
-        elif email.category == 'work':
+        elif email.category == "work":
             email.priority_score = 7
-        elif email.category == 'newsletter':
+        elif email.category == "newsletter":
             email.priority_score = 3
         else:
             email.priority_score = 5
 
-        pos = sum(1 for w in ['thank', 'great', 'excellent', 'congratulations'] if w in body_lower)
-        neg = sum(1 for w in ['sorry', 'problem', 'issue', 'error', 'cancel'] if w in body_lower)
-        email.sentiment = 'positive' if pos > neg else ('negative' if neg > pos else 'neutral')
+        pos = sum(1 for w in ["thank","great","excellent","congratulations"] if w in b)
+        neg = sum(1 for w in ["sorry","problem","issue","error","cancel"] if w in b)
+        email.sentiment = "positive" if pos > neg else ("negative" if neg > pos else "neutral")
         return email
 
-    def generate_conflict_resolution_email(self, conflict: ConflictInfo,
-                                            alternative_times: List[Tuple[datetime, datetime]]) -> str:
+    def generate_conflict_email(self, conflict: ConflictInfo,
+                                 alts: List[Tuple[datetime, datetime]]) -> str:
         if not self.llm:
-            return self._template_conflict_email(conflict, alternative_times)
+            return self._template_email(conflict, alts)
         try:
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", """You are a professional email assistant. Write a polite email to resolve a calendar conflict.
-Include: acknowledgment, conflict details, suggested alternatives, request for confirmation.
-Keep it professional and concise."""),
-                ("human", """Conflict:
-Meeting 1: {event1_summary} ({event1_time})
-Meeting 2: {event2_summary} ({event2_time})
-Overlap: {overlap_minutes} minutes
-
-Alternative times:
-{alternatives}
-
-Write the email:"""),
-            ])
-            alt_text = "\n".join([
+            alt_text = "\n".join(
                 f"- {s.strftime('%B %d, %Y at %I:%M %p')} - {e.strftime('%I:%M %p')}"
-                for s, e in alternative_times[:3]
+                for s, e in alts[:3]
+            )
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", "Write a polite professional email to resolve a calendar conflict. Include conflict details and suggest alternatives."),
+                ("human", "Meeting 1: {e1} ({t1})\nMeeting 2: {e2} ({t2})\nOverlap: {ov} min\nAlternatives:\n{alt}"),
             ])
-            chain    = prompt | self.llm
-            response = chain.invoke({
-                "event1_summary":  conflict.event1.summary,
-                "event1_time":     conflict.event1.start_time.strftime('%B %d at %I:%M %p'),
-                "event2_summary":  conflict.event2.summary,
-                "event2_time":     conflict.event2.start_time.strftime('%B %d at %I:%M %p'),
-                "overlap_minutes": conflict.overlap_minutes,
-                "alternatives":    alt_text,
+            resp = (prompt | self.llm).invoke({
+                "e1": conflict.event1.summary,
+                "t1": conflict.event1.start_time.strftime("%B %d at %I:%M %p"),
+                "e2": conflict.event2.summary,
+                "t2": conflict.event2.start_time.strftime("%B %d at %I:%M %p"),
+                "ov": conflict.overlap_minutes,
+                "alt": alt_text,
             })
-            return response.content
+            return resp.content
         except Exception as e:
             print(f"Error generating email: {e}")
-            return self._template_conflict_email(conflict, alternative_times)
+            return self._template_email(conflict, alts)
 
-    def _template_conflict_email(self, conflict: ConflictInfo,
-                                  alternative_times: List[Tuple[datetime, datetime]]) -> str:
+    def _template_email(self, conflict: ConflictInfo,
+                         alts: List[Tuple[datetime, datetime]]) -> str:
         body = (
-            f"Subject: Calendar Conflict — {conflict.event1.summary} and {conflict.event2.summary}\n\n"
-            f"Dear Team,\n\n"
-            f"I wanted to flag a scheduling conflict that has come up.\n\n"
+            f"Subject: Calendar Conflict - {conflict.event1.summary} and {conflict.event2.summary}\n\n"
+            f"Dear Team,\n\nI wanted to flag a scheduling conflict.\n\n"
             f"CONFLICT DETAILS:\n"
-            f"• Meeting 1: {conflict.event1.summary}\n"
-            f"  Time: {conflict.event1.start_time.strftime('%B %d, %Y at %I:%M %p')} — "
+            f"Meeting 1: {conflict.event1.summary}\n"
+            f"  {conflict.event1.start_time.strftime('%B %d, %Y at %I:%M %p')} - "
             f"{conflict.event1.end_time.strftime('%I:%M %p')}\n\n"
-            f"• Meeting 2: {conflict.event2.summary}\n"
-            f"  Time: {conflict.event2.start_time.strftime('%B %d, %Y at %I:%M %p')} — "
+            f"Meeting 2: {conflict.event2.summary}\n"
+            f"  {conflict.event2.start_time.strftime('%B %d, %Y at %I:%M %p')} - "
             f"{conflict.event2.end_time.strftime('%I:%M %p')}\n\n"
-            f"These meetings overlap by {conflict.overlap_minutes} minutes.\n\n"
-            f"ALTERNATIVE TIMES:\n"
+            f"Overlap: {conflict.overlap_minutes} minutes\n\nALTERNATIVE TIMES:\n"
         )
-        for i, (s, e) in enumerate(alternative_times[:3], 1):
-            body += f"{i}. {s.strftime('%B %d, %Y at %I:%M %p')} — {e.strftime('%I:%M %p')}\n"
-        body += (
-            "\nCould you please let me know which time works best, "
-            "or suggest another?\n\nThank you for your flexibility.\n\nBest regards\n"
-        )
+        for i, (s, e) in enumerate(alts[:3], 1):
+            body += f"{i}. {s.strftime('%B %d, %Y at %I:%M %p')} - {e.strftime('%I:%M %p')}\n"
+        body += "\nPlease let me know which time works best.\n\nBest regards\n"
         return body
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # ENHANCED EMAIL ASSISTANT
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 class EnhancedEmailAssistant:
-    """Main assistant class — no file-based auth, credentials injected externally."""
-
     def __init__(self):
         self.gmail    = GmailService()
         self.calendar = CalendarService()
         self.analyzer = AIAnalyzer()
         self.llm      = None
-
         self.conversation_memory: List = []
         self._load_memory()
-
-        self.emails_cache:    List[EmailData]    = []
+        self.emails_cache:    List[EmailData]     = []
         self.events_cache:    List[CalendarEvent] = []
         self.conflicts_cache: List[ConflictInfo]  = []
 
-    # ── Auth ─────────────────────────────────────────────────────────────────
-
     def inject_credentials(self, creds: Credentials) -> bool:
-        """Inject Google OAuth credentials into both services."""
-        ok_gmail    = self.gmail.inject_credentials(creds)
-        ok_calendar = self.calendar.inject_credentials(creds)
-        return ok_gmail and ok_calendar
-
-    # ── LLM ──────────────────────────────────────────────────────────────────
+        return self.gmail.inject_credentials(creds) and self.calendar.inject_credentials(creds)
 
     def initialize_llm(self, api_key: Optional[str] = None) -> bool:
         if api_key:
             self.analyzer = AIAnalyzer(api_key=api_key)
-            self.llm      = self.analyzer.llm
+            self.llm = self.analyzer.llm
         return self.llm is not None
-
-    # ── Memory ───────────────────────────────────────────────────────────────
 
     def _load_memory(self):
         os.makedirs(MEMORY_DIR, exist_ok=True)
         if os.path.exists(MEMORY_FILE):
             try:
-                with open(MEMORY_FILE, 'rb') as f:
+                with open(MEMORY_FILE, "rb") as f:
                     self.conversation_memory = pickle.load(f)
             except Exception:
                 self.conversation_memory = []
-
-    def _save_memory(self):
-        try:
-            with open(MEMORY_FILE, 'wb') as f:
-                pickle.dump(self.conversation_memory[-100:], f)
-        except Exception as e:
-            print(f"Error saving memory: {e}")
-
-    # ── Email ─────────────────────────────────────────────────────────────────
 
     def fetch_emails(self, query: str = "", max_results: int = 50) -> List[EmailData]:
         self.emails_cache = self.gmail.get_emails(query, max_results)
         return self.emails_cache
 
     def analyze_emails(self, emails: Optional[List[EmailData]] = None) -> List[EmailData]:
-        target   = emails or self.emails_cache
+        target = emails or self.emails_cache
         analyzed = [self.analyzer.analyze_email(e) for e in target]
         if not emails:
             self.emails_cache = analyzed
         return analyzed
 
-    def categorize_emails_ai(self, emails: Optional[List[EmailData]] = None) -> List[EmailData]:
+    def categorize_emails_ai(self, emails=None):
         return self.analyze_emails(emails)
-
-    # ── Calendar ──────────────────────────────────────────────────────────────
 
     def fetch_calendar_events(self, days_ahead: int = 30) -> List[CalendarEvent]:
         self.events_cache = self.calendar.get_events(days_ahead)
         return self.events_cache
 
-    def detect_conflicts(self, events: Optional[List[CalendarEvent]] = None) -> List[ConflictInfo]:
+    def detect_conflicts(self, events=None) -> List[ConflictInfo]:
         self.conflicts_cache = self.calendar.find_conflicts(events or self.events_cache)
         return self.conflicts_cache
 
     def find_free_slots(self, *args, **kwargs) -> List[Dict[str, Any]]:
-        """Flexible signature — see docstring for calling patterns."""
-        events           = kwargs.get('events', None)
-        duration_minutes = kwargs.get('duration_minutes', 60)
-        days_ahead       = kwargs.get('days_ahead', 7)
-        refresh_events   = kwargs.get('refresh_events', True)
-
+        events           = kwargs.get("events", None)
+        duration_minutes = kwargs.get("duration_minutes", 60)
+        days_ahead       = kwargs.get("days_ahead", 7)
         if len(args) >= 1:
-            first = args[0]
-            if isinstance(first, list):
-                events = first
+            f = args[0]
+            if isinstance(f, list):
+                events = f
                 if len(args) >= 2 and isinstance(args[1], int): duration_minutes = args[1]
                 if len(args) >= 3 and isinstance(args[2], int): days_ahead       = args[2]
-            elif isinstance(first, int):
-                duration_minutes = first
+            elif isinstance(f, int):
+                duration_minutes = f
                 if len(args) >= 2 and isinstance(args[1], int): days_ahead = args[1]
-                if len(args) >= 3 and isinstance(args[2], list): events    = args[2]
-
         if not isinstance(duration_minutes, int): duration_minutes = 60
         if not isinstance(days_ahead, int):       days_ahead       = 7
-
-        if events is None and refresh_events:
+        if events is None:
             self.fetch_calendar_events(days_ahead=days_ahead)
             events = self.events_cache
-        elif events is None:
-            events = self.events_cache
-
         return self.calendar.find_free_slots(events, duration_minutes, days_ahead)
 
-    # ── Conflict resolution ───────────────────────────────────────────────────
-
     def generate_conflict_resolution(self, conflict: ConflictInfo,
-                                     free_slots: Optional[List[Dict[str, Any]]] = None) -> str:
+                                     free_slots=None) -> str:
         if free_slots is None:
             free_slots = self.find_free_slots(
                 duration_minutes=conflict.event1.duration_minutes, days_ahead=14
             )
-        alternative_times = [
-            (s['start'], s['end']) if isinstance(s, dict) else s
+        alts = [
+            (s["start"], s["end"]) if isinstance(s, dict) else s
             for s in free_slots[:5]
         ]
-        return self.analyzer.generate_conflict_resolution_email(conflict, alternative_times)
+        return self.analyzer.generate_conflict_email(conflict, alts)
 
-    def generate_conflict_email(self, conflict: ConflictInfo,
-                                free_slots: Optional[List[Dict[str, Any]]] = None) -> str:
+    def generate_conflict_email(self, conflict, free_slots=None):
         return self.generate_conflict_resolution(conflict, free_slots)
 
     def get_conflict_recipients(self, conflict: ConflictInfo) -> List[str]:
@@ -940,216 +796,102 @@ class EnhancedEmailAssistant:
             if ev.attendees: recipients.update(ev.attendees)
         return [r for r in recipients if r and r.strip()]
 
-    def find_calendar_invitation_email(self, event: CalendarEvent) -> Optional[EmailData]:
+    def find_calendar_invitation_email(self, event: CalendarEvent):
         try:
             emails = self.gmail.get_emails(query=f'subject:"{event.summary}"', max_results=20)
-            for email in emails:
-                if email.has_calendar_event:
-                    if event.organizer and event.organizer.lower() in email.sender_email.lower():
-                        return email
-                    if event.summary.lower() in email.subject.lower():
-                        return email
-            return None
-        except Exception as e:
-            print(f"Error finding invitation email: {e}")
-            return None
+            for e in emails:
+                if e.has_calendar_event:
+                    if event.organizer and event.organizer.lower() in e.sender_email.lower():
+                        return e
+                    if event.summary.lower() in e.subject.lower():
+                        return e
+        except Exception:
+            pass
+        return None
 
-    def get_emails_by_date(self, target_date: datetime) -> List[EmailData]:
-        try:
-            date_str = target_date.strftime('%Y/%m/%d')
-            return self.gmail.get_emails(
-                query=f'after:{date_str} before:{date_str}', max_results=100
-            )
-        except Exception as e:
-            print(f"Error fetching emails by date: {e}")
-            return []
-
-    def send_conflict_resolution_email(self, conflict: ConflictInfo,
-                                       free_slots: Optional[List[Dict[str, Any]]] = None,
-                                       custom_recipients: Optional[List[str]] = None,
-                                       reply_to_invitation: bool = True) -> Dict[str, Any]:
-        result: Dict[str, Any] = {
-            'success': False, 'recipients': [], 'subject': '',
-            'error': None, 'method': 'draft', 'thread_id': None, 'email_stats': {}
-        }
-        try:
-            base_body = self.generate_conflict_resolution(conflict, free_slots)
-
-            invitation_email = None
-            if reply_to_invitation:
-                invitation_email = (
-                    self.find_calendar_invitation_email(conflict.event1)
-                    or self.find_calendar_invitation_email(conflict.event2)
-                )
-
-            conflict_date  = conflict.event1.start_time
-            emails_on_day  = self.get_emails_by_date(conflict_date)
-            email_count    = len(emails_on_day)
-
-            email_body  = base_body + "\n\n---\n"
-            email_body += f"📊 Email Statistics:\n"
-            email_body += f"• Date: {conflict_date.strftime('%A, %B %d, %Y')}\n"
-            email_body += f"• Total emails received on this day: {email_count}\n"
-            if invitation_email:
-                email_body += f"• This is in reply to: \"{invitation_email.subject}\"\n"
-                email_body += f"• Original invitation from: {invitation_email.sender}\n"
-
-            result['email_stats'] = {
-                'date': conflict_date.strftime('%Y-%m-%d'),
-                'count': email_count,
-                'emails': [
-                    {'subject': e.subject, 'from': e.sender, 'time': e.timestamp.strftime('%I:%M %p')}
-                    for e in emails_on_day[:5]
-                ],
-            }
-
-            if custom_recipients:
-                recipients = custom_recipients
-            elif invitation_email:
-                recipients = [invitation_email.sender_email]
-            else:
-                recipients = self.get_conflict_recipients(conflict)
-
-            if not recipients:
-                result['error'] = "No recipients found. Please specify recipients manually."
-                return result
-
-            if invitation_email:
-                subject   = f"Re: {invitation_email.subject} — Calendar Conflict Resolution"
-                thread_id = invitation_email.thread_id
-                result['thread_id'] = thread_id
-                result['method']    = 'reply'
-            else:
-                subject   = f"Calendar Conflict: {conflict.event1.summary} & {conflict.event2.summary}"
-                thread_id = None
-
-            sent_to = []
-            for recipient in recipients:
-                if invitation_email and thread_id:
-                    if self.send_email(recipient, subject, email_body, thread_id=thread_id):
-                        sent_to.append(recipient)
-                        result['method'] = 'sent_as_reply'
-                else:
-                    if self.create_draft(recipient, subject, email_body):
-                        sent_to.append(recipient)
-
-            result['success']    = len(sent_to) > 0
-            result['recipients'] = sent_to
-            result['subject']    = subject
-            result['message']    = (
-                f"{'Sent reply' if result['method'] == 'sent_as_reply' else 'Draft created'} "
-                f"for {len(sent_to)} recipient(s)"
-            )
-        except Exception as e:
-            result['error'] = str(e)
-            import traceback; traceback.print_exc()
-        return result
-
-    def send_email(self, to: str, subject: str, body: str,
-                   thread_id: Optional[str] = None) -> bool:
+    def send_email(self, to, subject, body, thread_id=None):
         return self.gmail.send_email(to, subject, body, thread_id)
 
-    def create_draft(self, to: str, subject: str, body: str) -> bool:
+    def create_draft(self, to, subject, body):
         return self.gmail.create_draft(to, subject, body)
 
-    # ── Ambient agent ─────────────────────────────────────────────────────────
-
-    def run_ambient_agent(self, thread_id: str = "default") -> Dict[str, Any]:
+    def run_ambient_agent(self) -> Dict[str, Any]:
         result = {
-            'status': 'success', 'emails_fetched': 0, 'emails_analyzed': 0,
-            'events_fetched': 0, 'conflicts_found': 0, 'suggestions': [], 'drafts_created': 0,
+            "status": "success", "emails_fetched": 0, "emails_analyzed": 0,
+            "events_fetched": 0, "conflicts_found": 0, "suggestions": [], "drafts_created": 0,
         }
         try:
-            emails = self.fetch_emails(max_results=50)
-            result['emails_fetched']  = len(emails)
+            emails   = self.fetch_emails(max_results=50)
+            result["emails_fetched"]  = len(emails)
             analyzed = self.analyze_emails(emails)
-            result['emails_analyzed'] = len(analyzed)
-
-            events = self.fetch_calendar_events(days_ahead=30)
-            result['events_fetched']  = len(events)
+            result["emails_analyzed"] = len(analyzed)
+            events   = self.fetch_calendar_events(days_ahead=30)
+            result["events_fetched"]  = len(events)
             conflicts = self.detect_conflicts(events)
-            result['conflicts_found'] = len(conflicts)
+            result["conflicts_found"] = len(conflicts)
 
-            suggestions = []
-            urgent   = [e for e in analyzed if e.priority_score and e.priority_score >= 8]
-            if urgent:
-                suggestions.append(f"You have {len(urgent)} high-priority emails requiring attention")
+            s = []
+            urgent = [e for e in analyzed if e.priority_score and e.priority_score >= 8]
+            if urgent: s.append(f"You have {len(urgent)} high-priority emails requiring attention")
             unread_imp = [e for e in analyzed if e.is_unread and e.is_important]
-            if unread_imp:
-                suggestions.append(f"You have {len(unread_imp)} unread important emails")
-            if conflicts:
-                suggestions.append(f"Found {len(conflicts)} calendar conflicts that need resolution")
+            if unread_imp: s.append(f"You have {len(unread_imp)} unread important emails")
+            if conflicts: s.append(f"Found {len(conflicts)} calendar conflicts that need resolution")
             today_ev = [e for e in events if e.start_time.date() == datetime.now().date()]
-            if today_ev:
-                suggestions.append(f"You have {len(today_ev)} events scheduled for today")
-            result['suggestions'] = suggestions
+            if today_ev: s.append(f"You have {len(today_ev)} events scheduled for today")
+            result["suggestions"] = s
 
-            for conflict in conflicts[:3]:
-                self.generate_conflict_resolution(conflict)
-                result['drafts_created'] += 1
-
-            return result
+            for c in conflicts[:3]:
+                self.generate_conflict_resolution(c)
+                result["drafts_created"] += 1
         except Exception as e:
-            result['status'] = 'error'
-            result['error']  = str(e)
-            return result
+            result["status"] = "error"
+            result["error"]  = str(e)
+        return result
 
 
-# ============================================================================
-# STREAMLIT APP ENTRY POINT
-# ============================================================================
+# ---------------------------------------------------------------------------
+# STREAMLIT APP
+# ---------------------------------------------------------------------------
 
 def main():
-    st.set_page_config(
-        page_title="Ambient Email Assistant",
-        page_icon="📬",
-        layout="wide",
-    )
+    st.set_page_config(page_title="Ambient Email Assistant", page_icon="📬", layout="wide")
 
-    # ── OAuth gate ───────────────────────────────────────────────────────────
     creds = handle_google_auth()
     if creds is None:
-        st.stop()  # Login UI already rendered inside handle_google_auth()
+        st.stop()
 
-    # ── Sign-out button ──────────────────────────────────────────────────────
     with st.sidebar:
-        st.success("✅ Connected to Google")
+        st.success("Connected to Google")
         if st.button("Sign out"):
-            st.session_state.pop("google_creds_token", None)
+            st.session_state.pop("_gcreds", None)
             st.query_params.clear()
             st.rerun()
+        st.markdown("---")
+        openai_key = st.text_input("OpenAI API key (optional)", type="password",
+                                   help="Enables AI email categorisation")
 
-    # ── Build assistant with injected credentials ────────────────────────────
     if "assistant" not in st.session_state:
         st.session_state["assistant"] = EnhancedEmailAssistant()
 
     assistant: EnhancedEmailAssistant = st.session_state["assistant"]
     assistant.inject_credentials(creds)
+    if openai_key:
+        assistant.initialize_llm(api_key=openai_key)
 
-    # Optional: OpenAI key for AI features
-    with st.sidebar:
-        st.markdown("---")
-        openai_key = st.text_input("OpenAI API key (optional)", type="password",
-                                   help="Enables AI-powered email categorisation and conflict drafts")
-        if openai_key:
-            assistant.initialize_llm(api_key=openai_key)
-
-    # ── Main UI ───────────────────────────────────────────────────────────────
     st.title("📬 Ambient Email Assistant")
 
-    tab_emails, tab_calendar, tab_agent = st.tabs(["📧 Emails", "📅 Calendar", "🤖 Ambient Agent"])
+    tab_emails, tab_calendar, tab_agent = st.tabs(["📧 Emails", "📅 Calendar", "🤖 Agent"])
 
-    # ── Emails tab ────────────────────────────────────────────────────────────
     with tab_emails:
         st.subheader("Your Emails")
         col_q, col_n, col_btn = st.columns([3, 1, 1])
         with col_q:
-            query = st.text_input("Search query", placeholder="e.g. is:unread label:important")
+            query = st.text_input("Search query", placeholder="is:unread label:important")
         with col_n:
-            max_results = st.number_input("Max results", min_value=1, max_value=200, value=20)
+            max_results = st.number_input("Max", 1, 200, 20)
         with col_btn:
             st.write("")
-            fetch_btn = st.button("Fetch Emails", use_container_width=True)
+            fetch_btn = st.button("Fetch", use_container_width=True)
 
         if fetch_btn:
             with st.spinner("Fetching emails…"):
@@ -1160,73 +902,66 @@ def main():
             if st.button("Analyse with AI"):
                 with st.spinner("Analysing…"):
                     assistant.analyze_emails()
-                st.success("Analysis complete")
+                st.success("Done")
 
             for email in assistant.emails_cache[:50]:
-                with st.expander(f"{'🔴' if email.is_unread else '⚪'} {email.subject}  —  {email.sender}"):
-                    cols = st.columns(4)
-                    cols[0].metric("Category",  email.category  or "—")
-                    cols[1].metric("Priority",  f"{email.priority_score}/10" if email.priority_score else "—")
-                    cols[2].metric("Sentiment", email.sentiment or "—")
-                    cols[3].metric("Date",      email.timestamp.strftime('%b %d'))
-                    st.text_area("Body", email.body[:500], height=100, key=f"body_{email.id}")
+                badge = "🔴" if email.is_unread else "⚪"
+                with st.expander(f"{badge} {email.subject} — {email.sender}"):
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Category",  email.category or "—")
+                    c2.metric("Priority",  f"{email.priority_score}/10" if email.priority_score else "—")
+                    c3.metric("Sentiment", email.sentiment or "—")
+                    c4.metric("Date",      email.timestamp.strftime("%b %d"))
+                    st.text_area("Body", email.body[:500], height=100, key=f"b_{email.id}")
                     if email.action_items:
-                        st.markdown("**Action items:** " + " • ".join(email.action_items))
+                        st.markdown("**Actions:** " + " • ".join(email.action_items))
 
-    # ── Calendar tab ──────────────────────────────────────────────────────────
     with tab_calendar:
         st.subheader("Calendar & Conflicts")
         days = st.slider("Days ahead", 1, 90, 30)
-        if st.button("Fetch Calendar Events"):
-            with st.spinner("Fetching events…"):
+        if st.button("Fetch Calendar"):
+            with st.spinner("Fetching…"):
                 events    = assistant.fetch_calendar_events(days_ahead=days)
                 conflicts = assistant.detect_conflicts()
-            st.success(f"Fetched {len(events)} events, {len(conflicts)} conflicts")
+            st.success(f"{len(events)} events, {len(conflicts)} conflicts")
 
         if assistant.events_cache:
-            st.markdown(f"**{len(assistant.events_cache)} upcoming events**")
             for ev in assistant.events_cache[:20]:
                 st.write(f"- **{ev.summary}** — {ev.start_time.strftime('%b %d %I:%M %p')} → {ev.end_time.strftime('%I:%M %p')}")
 
         if assistant.conflicts_cache:
-            st.markdown(f"### ⚠️ {len(assistant.conflicts_cache)} Conflict(s) Found")
+            st.markdown(f"### ⚠️ {len(assistant.conflicts_cache)} Conflict(s)")
             for i, conflict in enumerate(assistant.conflicts_cache):
                 with st.expander(str(conflict)):
-                    st.write(f"**Overlap:** {conflict.overlap_minutes} minutes")
-                    if st.button("Generate Resolution Email", key=f"resolve_{i}"):
+                    st.write(f"Overlap: {conflict.overlap_minutes} min")
+                    if st.button("Generate Resolution Email", key=f"r_{i}"):
                         with st.spinner("Generating…"):
-                            email_body = assistant.generate_conflict_resolution(conflict)
-                        st.text_area("Draft email", email_body, height=300, key=f"draft_{i}")
-
-                    if st.button("Find Free Slots", key=f"slots_{i}"):
-                        with st.spinner("Scanning calendar…"):
+                            body = assistant.generate_conflict_resolution(conflict)
+                        st.text_area("Draft", body, height=300, key=f"d_{i}")
+                    if st.button("Find Free Slots", key=f"f_{i}"):
+                        with st.spinner("Scanning…"):
                             slots = assistant.find_free_slots(
-                                duration_minutes=conflict.event1.duration_minutes,
-                                days_ahead=14,
+                                duration_minutes=conflict.event1.duration_minutes, days_ahead=14
                             )
-                        st.write(f"Found {len(slots)} free slots:")
                         for slot in slots[:5]:
                             st.write(f"- {slot['start'].strftime('%b %d %I:%M %p')} — {slot['end'].strftime('%I:%M %p')}")
 
-    # ── Ambient agent tab ─────────────────────────────────────────────────────
     with tab_agent:
-        st.subheader("🤖 Run Ambient Agent")
-        st.write("Fetches emails, analyses them, checks for calendar conflicts, and surfaces suggestions.")
-        if st.button("Run Agent Now", type="primary"):
-            with st.spinner("Running ambient agent…"):
+        st.subheader("🤖 Ambient Agent")
+        st.write("Fetches emails, analyses them, checks conflicts, and surfaces suggestions.")
+        if st.button("Run Agent", type="primary"):
+            with st.spinner("Running…"):
                 result = assistant.run_ambient_agent()
-            if result['status'] == 'success':
-                cols = st.columns(4)
-                cols[0].metric("Emails fetched",   result['emails_fetched'])
-                cols[1].metric("Emails analysed",  result['emails_analyzed'])
-                cols[2].metric("Events fetched",   result['events_fetched'])
-                cols[3].metric("Conflicts found",  result['conflicts_found'])
-                if result['suggestions']:
-                    st.markdown("### 💡 Suggestions")
-                    for s in result['suggestions']:
-                        st.info(s)
+            if result["status"] == "success":
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Emails fetched",  result["emails_fetched"])
+                c2.metric("Emails analysed", result["emails_analyzed"])
+                c3.metric("Events",          result["events_fetched"])
+                c4.metric("Conflicts",       result["conflicts_found"])
+                for s in result["suggestions"]:
+                    st.info(s)
             else:
-                st.error(f"Agent error: {result.get('error')}")
+                st.error(f"Error: {result.get('error')}")
 
 
 if __name__ == "__main__":

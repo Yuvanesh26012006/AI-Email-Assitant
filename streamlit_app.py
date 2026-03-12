@@ -148,14 +148,24 @@ def handle_google_auth() -> Optional[Credentials]:
         code = params["code"]
         try:
             flow = get_oauth_flow()
-            flow.fetch_token(code=code)
+
+            # PKCE fix: newer google-auth-oauthlib adds a code_challenge to the
+            # auth URL automatically. The matching code_verifier must be passed
+            # back at token-exchange time. We saved it in session_state below.
+            fetch_kwargs: dict = {"code": code}
+            if "oauth_code_verifier" in st.session_state:
+                fetch_kwargs["code_verifier"] = st.session_state.pop("oauth_code_verifier")
+
+            flow.fetch_token(**fetch_kwargs)
             creds = flow.credentials
             _save_creds_to_session(creds)
-            # Remove the code from the URL so refresh doesn't re-use it
+            # Remove the code from the URL so a page refresh doesn't re-use it
             st.query_params.clear()
             st.rerun()
         except Exception as e:
             st.error(f"OAuth token exchange failed: {e}")
+            # Clear stale verifier so the user can try again cleanly
+            st.session_state.pop("oauth_code_verifier", None)
         return None
 
     # ── Not authenticated yet — show login UI ────────────────────────────────
@@ -165,6 +175,11 @@ def handle_google_auth() -> Optional[Credentials]:
         access_type="offline",
         include_granted_scopes="true",
     )
+
+    # Save code_verifier (if PKCE was used) so token exchange can find it
+    # after the Streamlit rerun triggered by the redirect callback.
+    if hasattr(flow, "code_verifier") and flow.code_verifier:
+        st.session_state["oauth_code_verifier"] = flow.code_verifier
 
     st.markdown(
         """

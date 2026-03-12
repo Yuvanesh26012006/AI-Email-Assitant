@@ -1,0 +1,33 @@
+# Google API dependencies
+google-api-python-client==2.108.0
+google-auth==2.25.2
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+
+# LangChain and LangGraph dependencies
+langchain==0.1.0
+langgraph==0.0.40
+langchain-openai==0.0.2
+langchain-core==0.1.10
+langchain-community==0.0.12
+
+# Data validation and parsing
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Streamlit and web framework
+streamlit==1.29.0
+streamlit-extras==0.3.6
+
+# Flask for API server (optional)
+flask==3.0.0
+flask-cors==4.0.0
+
+# Additional utilities
+requests==2.31.0
+python-dateutil==2.8.2
+plotly==5.18.0
+pandas==2.1.4

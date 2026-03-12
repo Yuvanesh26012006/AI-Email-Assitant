@@ -64,40 +64,80 @@ MEMORY_FILE  = os.path.join(MEMORY_DIR, 'conversation_memory.pkl')
 # SECRETS HELPER  (Streamlit Cloud support)
 # ─────────────────────────────────────────────────────────────
 
-def _prepare_credential_files() -> Tuple[str, str]:
-    """
-    Write Google credentials & token from Streamlit Secrets to temp files.
-    Falls back to local files (credentials.json / token.json) when running locally.
-    Returns (credentials_file_path, token_file_path).
-    """
-    creds_path = CREDS_FILE
-    token_path = TOKEN_FILE
-
+def _get_credentials_json() -> str:
+    """Get the OAuth client credentials.json content from Secrets or local file."""
     try:
         import streamlit as st
         google = st.secrets.get("google", {})
-
         creds_json = google.get("credentials_json", "")
         if creds_json:
-            with open(creds_path, "w") as f:
-                f.write(creds_json)
-
-        tok_json = google.get("token_json", "")
-        if tok_json:
-            with open(token_path, "w") as f:
-                f.write(tok_json)
-
+            return creds_json
     except Exception:
-        # Not in Streamlit — look for local files next to this script
-        here = os.path.dirname(os.path.abspath(__file__))
-        local_creds = os.path.join(here, 'credentials.json')
-        local_token = os.path.join(here, 'token.json')
-        if os.path.exists(local_creds):
-            creds_path = local_creds
-        if os.path.exists(local_token):
-            token_path = local_token
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    local_creds = os.path.join(here, 'credentials.json')
+    if os.path.exists(local_creds):
+        with open(local_creds) as f:
+            return f.read()
+    return ""
 
-    return creds_path, token_path
+
+def _write_creds_file() -> str:
+    """Write credentials.json to temp file and return path."""
+    content = _get_credentials_json()
+    if not content:
+        return ""
+    with open(CREDS_FILE, "w") as f:
+        f.write(content)
+    return CREDS_FILE
+
+
+def get_oauth_auth_url(redirect_uri: str) -> Tuple[str, str]:
+    """
+    Generate a Google OAuth authorization URL for the user to visit.
+    Uses web Flow (not InstalledAppFlow) so it works on Streamlit Cloud.
+    Returns (auth_url, state).
+    """
+    if not GOOGLE_AVAILABLE:
+        return "", ""
+    creds_file = _write_creds_file()
+    if not creds_file:
+        return "", ""
+    try:
+        from google_auth_oauthlib.flow import Flow
+        flow = Flow.from_client_secrets_file(
+            creds_file, SCOPES, redirect_uri=redirect_uri)
+        auth_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent'
+        )
+        return auth_url, state
+    except Exception as e:
+        print(f"Auth URL error: {e}")
+        return "", ""
+
+
+def exchange_code_for_token(code: str, redirect_uri: str) -> Optional[dict]:
+    """
+    Exchange an OAuth authorization code for user credentials.
+    Uses web Flow — works for any user who logs in.
+    Returns token dict or None on failure.
+    """
+    if not GOOGLE_AVAILABLE:
+        return None
+    creds_file = _write_creds_file()
+    if not creds_file:
+        return None
+    try:
+        from google_auth_oauthlib.flow import Flow
+        flow = Flow.from_client_secrets_file(
+            creds_file, SCOPES, redirect_uri=redirect_uri)
+        flow.fetch_token(code=code)
+        return json.loads(flow.credentials.to_json())
+    except Exception as e:
+        print(f"Token exchange error: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -182,38 +222,66 @@ class GmailService:
         self.creds   = None
         self.last_error = ""
 
-    def authenticate(self) -> bool:
+    def authenticate(self, token_dict: dict = None) -> bool:
+        """
+        Authenticate using a per-user token dict (from OAuth flow).
+        Falls back to Streamlit Secrets token for local/single-user use.
+        """
         try:
             if not GOOGLE_AVAILABLE:
                 self.last_error = f"Google libraries not installed. Check requirements.txt. Detail: {GOOGLE_IMPORT_ERROR}"
                 return False
 
-            creds_file, token_file = _prepare_credential_files()
-
-            # ── Load token ────────────────────────────────────
-            if not os.path.exists(token_file):
-                self.last_error = "token.json not found. Make sure token_json is in Streamlit Secrets."
-                return False
-
-            try:
-                self.creds = Credentials.from_authorized_user_file(token_file, SCOPES)
-            except Exception as e:
-                self.last_error = f"Failed to load token.json: {e}"
-                return False
+            # ── Build credentials from token dict (per-user OAuth) ──
+            if token_dict:
+                try:
+                    import google.oauth2.credentials as gc
+                    self.creds = gc.Credentials(
+                        token=token_dict.get('token'),
+                        refresh_token=token_dict.get('refresh_token'),
+                        token_uri=token_dict.get('token_uri', 'https://oauth2.googleapis.com/token'),
+                        client_id=token_dict.get('client_id'),
+                        client_secret=token_dict.get('client_secret'),
+                        scopes=token_dict.get('scopes', SCOPES),
+                    )
+                except Exception as e:
+                    self.last_error = f"Failed to build credentials: {e}"
+                    return False
+            else:
+                # ── Fallback: load from Streamlit Secrets token_json ──
+                tok_json = ""
+                try:
+                    import streamlit as st
+                    tok_json = st.secrets.get("google", {}).get("token_json", "")
+                except Exception:
+                    pass
+                if not tok_json:
+                    here = os.path.dirname(os.path.abspath(__file__))
+                    local_token = os.path.join(here, 'token.json')
+                    if os.path.exists(local_token):
+                        with open(local_token) as f:
+                            tok_json = f.read()
+                if not tok_json:
+                    self.last_error = "No token found. Please connect your Gmail account."
+                    return False
+                with open(TOKEN_FILE, 'w') as f:
+                    f.write(tok_json)
+                try:
+                    self.creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+                except Exception as e:
+                    self.last_error = f"Failed to load token: {e}"
+                    return False
 
             # ── Refresh if expired ────────────────────────────
             if not self.creds.valid:
                 if self.creds.expired and self.creds.refresh_token:
                     try:
                         self.creds.refresh(Request())
-                        # Save refreshed token back to temp file
-                        with open(token_file, 'w') as f:
-                            f.write(self.creds.to_json())
                     except Exception as e:
-                        self.last_error = f"Token refresh failed: {e}. Try re-generating token.json locally and updating Streamlit Secrets."
+                        self.last_error = f"Token refresh failed: {e}"
                         return False
                 else:
-                    self.last_error = "Token is invalid and has no refresh_token. Re-generate token.json locally and update Streamlit Secrets."
+                    self.last_error = "Token invalid. Please reconnect your Gmail."
                     return False
 
             self.service = build('gmail', 'v1', credentials=self.creds)
@@ -343,35 +411,63 @@ class CalendarService:
         self.creds      = None
         self.last_error = ""
 
-    def authenticate(self) -> bool:
+    def authenticate(self, token_dict: dict = None) -> bool:
+        """
+        Authenticate using a per-user token dict (from OAuth flow).
+        Falls back to Streamlit Secrets token for local/single-user use.
+        """
         try:
             if not GOOGLE_AVAILABLE:
                 self.last_error = f"Google libraries not installed. Check requirements.txt. Detail: {GOOGLE_IMPORT_ERROR}"
                 return False
 
-            creds_file, token_file = _prepare_credential_files()
-
-            if not os.path.exists(token_file):
-                self.last_error = "token.json not found in Streamlit Secrets."
-                return False
-
-            try:
-                self.creds = Credentials.from_authorized_user_file(token_file, SCOPES)
-            except Exception as e:
-                self.last_error = f"Failed to load token.json: {e}"
-                return False
+            if token_dict:
+                try:
+                    import google.oauth2.credentials as gc
+                    self.creds = gc.Credentials(
+                        token=token_dict.get('token'),
+                        refresh_token=token_dict.get('refresh_token'),
+                        token_uri=token_dict.get('token_uri', 'https://oauth2.googleapis.com/token'),
+                        client_id=token_dict.get('client_id'),
+                        client_secret=token_dict.get('client_secret'),
+                        scopes=token_dict.get('scopes', SCOPES),
+                    )
+                except Exception as e:
+                    self.last_error = f"Failed to build credentials: {e}"
+                    return False
+            else:
+                tok_json = ""
+                try:
+                    import streamlit as st
+                    tok_json = st.secrets.get("google", {}).get("token_json", "")
+                except Exception:
+                    pass
+                if not tok_json:
+                    here = os.path.dirname(os.path.abspath(__file__))
+                    local_token = os.path.join(here, 'token.json')
+                    if os.path.exists(local_token):
+                        with open(local_token) as f:
+                            tok_json = f.read()
+                if not tok_json:
+                    self.last_error = "No token found. Please connect your Gmail account."
+                    return False
+                with open(TOKEN_FILE, 'w') as f:
+                    f.write(tok_json)
+                try:
+                    self.creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+                except Exception as e:
+                    self.last_error = f"Failed to load token: {e}"
+                    return False
 
             if not self.creds.valid:
                 if self.creds.expired and self.creds.refresh_token:
                     try:
                         self.creds.refresh(Request())
-                        with open(token_file, "w") as f:
-                            f.write(self.creds.to_json())
                     except Exception as e:
                         self.last_error = f"Calendar token refresh failed: {e}"
                         return False
                 else:
-                    self.last_error = "Calendar token invalid. Re-generate token.json locally."
+                    self.last_error = "Calendar token invalid. Please reconnect."
                     return False
 
             self.service = build("calendar", "v3", credentials=self.creds)
@@ -578,11 +674,15 @@ class EnhancedEmailAssistant:
         self._load_memory()
 
     # Auth
-    def authenticate(self) -> bool:
-        gmail_ok = self.gmail.authenticate()
+    def authenticate(self, token_dict: dict = None) -> bool:
+        """
+        Authenticate both Gmail and Calendar.
+        Pass token_dict (from per-user OAuth) or None to use Streamlit Secrets fallback.
+        """
+        gmail_ok = self.gmail.authenticate(token_dict=token_dict)
         if not gmail_ok:
             raise Exception(self.gmail.last_error)
-        cal_ok = self.calendar.authenticate()
+        cal_ok = self.calendar.authenticate(token_dict=token_dict)
         if not cal_ok:
             raise Exception(self.calendar.last_error)
         return True

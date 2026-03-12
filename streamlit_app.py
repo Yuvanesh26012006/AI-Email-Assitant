@@ -26,7 +26,7 @@ st.set_page_config(
 
 # Import the enhanced assistant
 try:
-    from ambient_email_assistant_enhanced import EnhancedEmailAssistant, EmailData, CalendarEvent
+    from ambient_email_assistant_enhanced import EnhancedEmailAssistant, EmailData, CalendarEvent, get_oauth_auth_url, exchange_code_for_token
 except ImportError as e:
     st.error(f"❌ Cannot import ambient_email_assistant_enhanced.\nError: {e}\nDirectory: {BASE_DIR}\nFiles: {os.listdir(BASE_DIR)}")
     st.stop()
@@ -124,13 +124,22 @@ def init_session_state():
         'emails': [], 'calendar_events': [], 'conflicts': [],
         'current_view': 'dashboard', 'selected_email': None,
         'workflow_result': None, 'loading': False,
-        'email_filter': 'all', 'sort_by': 'date_desc', 'show_ai_enabled': False
+        'email_filter': 'all', 'sort_by': 'date_desc', 'show_ai_enabled': False,
+        'user_token': None,   # per-user OAuth token dict
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 init_session_state()
+
+# ── Handle OAuth callback BEFORE anything else ────────────────
+# This runs when Google redirects back with ?code=...
+if "code" in st.query_params and not st.session_state.authenticated:
+    # Functions defined later but we defer via rerun — use a flag
+    st.session_state['_oauth_code'] = st.query_params.get("code")
+    st.query_params.clear()
+    st.rerun()
 
 # ── Helpers ───────────────────────────────────────────────────
 def show_loading(message="Loading..."):
@@ -163,13 +172,26 @@ def init_assistant():
                 return False
     return True
 
-def authenticate():
+def get_app_url() -> str:
+    """Get the current Streamlit app URL for OAuth redirect."""
+    try:
+        url = st.secrets.get("APP_URL", "")
+        if url:
+            return url.rstrip("/")
+    except Exception:
+        pass
+    return "https://inboxai.streamlit.app"
+
+
+def authenticate(token_dict: dict = None):
+    """Authenticate using a per-user token dict, or fall back to Secrets."""
     if st.session_state.authenticated:
         return True
     with show_loading("Authenticating with Google..."):
         try:
-            st.session_state.assistant.authenticate()   # raises with real error on failure
+            st.session_state.assistant.authenticate(token_dict=token_dict)
             st.session_state.authenticated = True
+            st.session_state.user_token = token_dict
 
             # Try OpenAI key from Streamlit Secrets first, then env
             openai_key = None
@@ -185,8 +207,30 @@ def authenticate():
             return True
         except Exception as e:
             show_error(f"Authentication failed: {e}")
-            st.info("💡 If you see a token refresh error, re-run the app locally to get a fresh token.json, then update Streamlit Secrets.")
             return False
+
+
+def handle_oauth_callback():
+    """
+    Check URL query params for OAuth callback code and exchange it for a token.
+    Returns True if a new token was obtained.
+    """
+    params = st.query_params
+    code = params.get("code")
+    if not code or st.session_state.authenticated:
+        return False
+
+    # Clear the code from URL immediately
+    st.query_params.clear()
+
+    app_url = get_app_url()
+    with show_loading("Completing Google sign-in..."):
+        token_dict = exchange_code_for_token(code, redirect_uri=app_url)
+        if token_dict:
+            if init_assistant():
+                return authenticate(token_dict=token_dict)
+        show_error("Failed to complete Google sign-in. Please try again.")
+    return False
 
 def fetch_emails(max_results=50, query=''):
     with show_loading(f"Fetching {max_results} emails..."):
@@ -257,6 +301,15 @@ def sort_emails(emails, sort_by='date_desc'):
     if sort_by == 'priority':  return sorted(emails, key=lambda e: (e.priority_score or 0), reverse=True)
     return emails
 
+# ── Process stored OAuth code (after functions are defined) ──
+if st.session_state.get('_oauth_code') and not st.session_state.authenticated:
+    code = st.session_state.pop('_oauth_code')
+    app_url = get_app_url()
+    token_dict = exchange_code_for_token(code, redirect_uri=app_url)
+    if token_dict and init_assistant():
+        if authenticate(token_dict=token_dict):
+            st.rerun()
+
 # ── Sidebar ───────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<h2 style="text-align: center;">📧 AI Email Assistant</h2>', unsafe_allow_html=True)
@@ -264,10 +317,21 @@ with st.sidebar:
     st.subheader("🔐 Connection")
 
     if not st.session_state.authenticated:
-        if st.button("🔑 Connect to Gmail", use_container_width=True, type="primary"):
-            if init_assistant() and authenticate():
-                show_success("Successfully authenticated!")
-                st.rerun()
+        app_url = get_app_url()
+        auth_url, _ = get_oauth_auth_url(redirect_uri=app_url)
+        if auth_url:
+            st.markdown(
+                f'''<a href="{auth_url}" target="_self" style="
+                    display:block; text-align:center; padding:10px;
+                    background:#00E5A0; color:#000; font-weight:bold;
+                    border-radius:8px; text-decoration:none; font-size:15px;">
+                    🔑 Connect to Gmail
+                </a>''',
+                unsafe_allow_html=True
+            )
+        else:
+            st.error("❌ credentials.json missing from Streamlit Secrets.\nAdd `credentials_json` under `[google]` in your app secrets.")
+            st.info("📖 See the setup guide below ↓")
     else:
         st.markdown('<div class="success-box"><strong>✅ Connected to Gmail</strong></div>', unsafe_allow_html=True)
         if st.session_state.show_ai_enabled:

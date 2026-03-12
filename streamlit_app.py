@@ -1,650 +1,1198 @@
 """
-AI Email Assistant — Multi-User Edition
-HOW THE AUTH FLOW WORKS:
-  1. Click "Connect to Gmail"
-  2. Open the Google link → sign in → click Allow
-  3. Browser shows "This site can't be reached" — THAT IS NORMAL AND EXPECTED
-  4. Copy the full URL from your browser address bar and paste it in the sidebar
-  5. Click Connect — done!
+Ambient Email Assistant - Enhanced Version
+AI-powered email and calendar management with LangGraph workflows
+Compatible with Streamlit Cloud (browser-based OAuth, no credentials.json needed)
 """
 
+import os
+import pickle
+import base64
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Any, Tuple
+from dataclasses import dataclass, field
+from email.mime.text import MIMEText
+import re
+
+# Streamlit
 import streamlit as st
-import os, json, time, socket
-from datetime import datetime
-from urllib.parse import urlparse, parse_qs
 
-st.set_page_config(page_title="AI Email Assistant", page_icon="📧",
-                   layout="wide", initial_sidebar_state="expanded")
-
-from google_auth_oauthlib.flow import Flow
-from google.oauth2.credentials import Credentials
+# Google API imports
 from google.auth.transport.requests import Request
-import requests as http_req
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
+# LangChain imports
 try:
-    from ambient_email_assistant_enhanced import EnhancedEmailAssistant
+    from langchain_openai import ChatOpenAI
+    from langchain.prompts import ChatPromptTemplate
+    from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+    LANGCHAIN_AVAILABLE = True
 except ImportError:
-    st.error("Cannot find ambient_email_assistant_enhanced.py — put it in the same folder.")
-    st.stop()
+    LANGCHAIN_AVAILABLE = False
+    print("Warning: LangChain not available. AI features will be disabled.")
+
+# LangGraph imports
+try:
+    from langgraph.graph import StateGraph, END
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    LANGGRAPH_AVAILABLE = True
+except ImportError:
+    LANGGRAPH_AVAILABLE = False
+    print("Warning: LangGraph not available. Workflow features will be limited.")
+
+# Environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/calendar.readonly",
-    "https://www.googleapis.com/auth/calendar.events",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "openid",
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/gmail.compose',
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/calendar.readonly',
+    'https://www.googleapis.com/auth/calendar.events'
 ]
-CREDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
 
-st.markdown("""
-<style>
-:root{--g:#00E5A0;--b:#00B8D4;--r:#FF6B6B;--y:#FFB800;}
-#MainMenu,footer{visibility:hidden;}
-::-webkit-scrollbar{width:8px;}::-webkit-scrollbar-thumb{background:var(--g);border-radius:4px;}
-.mhdr{font-size:2.4rem;font-weight:700;text-align:center;padding:1rem 0;
-  background:linear-gradient(135deg,#00E5A0,#00B8D4);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;}
-.shdr{font-size:1.7rem;font-weight:600;color:var(--g);
-  border-bottom:2px solid var(--g);padding-bottom:.4rem;margin:1.2rem 0 .8rem;}
-.card{background:linear-gradient(135deg,#1C1C21,#232328);padding:1.4rem;border-radius:12px;
-  border:1px solid var(--g);box-shadow:0 4px 16px rgba(0,229,160,.1);margin-bottom:1rem;}
-.ecard{background:#1C1C21;padding:1rem;border-radius:10px;
-  border-left:4px solid var(--g);margin-bottom:.8rem;transition:all .2s;}
-.ecard:hover{background:#232328;border-left-color:var(--b);transform:translateX(4px);}
-.ccard{background:#1C1C21;padding:1rem;border-radius:8px;
-  border-left:4px solid var(--b);margin-bottom:.6rem;}
-.cfcard{background:linear-gradient(135deg,#2a1a1a,#3a2020);padding:1.2rem;
-  border-radius:10px;border-left:4px solid var(--r);margin-bottom:.8rem;}
-.ok{background:linear-gradient(135deg,#1a2a1a,#1a3a1a);border:1px solid var(--g);
-  padding:1rem;border-radius:8px;margin:.8rem 0;}
-.wn{background:linear-gradient(135deg,#2a2a1a,#3a3020);border:1px solid var(--y);
-  padding:1rem;border-radius:8px;margin:.8rem 0;}
-.er{background:linear-gradient(135deg,#2a1a1a,#3a2020);border:1px solid var(--r);
-  padding:1rem;border-radius:8px;margin:.8rem 0;}
-.ob{background:linear-gradient(135deg,#0f1f2f,#1a2a3a);border:1px solid var(--b);
-  padding:1.2rem;border-radius:10px;margin:.6rem 0;}
-.stButton>button{background:linear-gradient(135deg,#00E5A0,#00B8D4);color:#000;
-  font-weight:700;border:none;padding:.6rem 2rem;border-radius:8px;
-  box-shadow:0 2px 8px rgba(0,229,160,.2);transition:all .3s;}
-.stButton>button:hover{transform:translateY(-2px);}
-.badge{display:inline-block;padding:.25rem .7rem;border-radius:20px;
-  font-size:.8rem;font-weight:600;margin-right:.4rem;}
-.bu{background:#00B8D4;color:#000;}.bi{background:#FFB800;color:#000;}
-.bc{background:#8B5CF6;color:#fff;}
-.sv{font-size:2.5rem;font-weight:700;
-  background:linear-gradient(135deg,#00E5A0,#00B8D4);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;}
-.sl{font-size:.9rem;color:#A3A3A3;margin-top:.4rem;}
-.stProgress>div>div>div>div{background:linear-gradient(90deg,#00E5A0,#00B8D4);}
-[data-testid="stSidebar"]{background:linear-gradient(180deg,#0D0D0F,#18181B);}
-.stTabs [data-baseweb="tab-list"]{gap:8px;background:#1C1C21;padding:.5rem;border-radius:10px;}
-.stTabs [data-baseweb="tab"]{background:transparent;border-radius:8px;
-  color:#A3A3A3;font-weight:600;padding:.8rem 1.5rem;}
-.stTabs [aria-selected="true"]{background:linear-gradient(135deg,#00E5A0,#00B8D4);color:#000;}
-</style>
-""", unsafe_allow_html=True)
+# Streamlit Cloud app URL — used as the OAuth redirect URI
+APP_URL = "https://inboxai.streamlit.app"
+REDIRECT_URI = APP_URL  # Google will redirect here after user grants access
 
-# ── Session state ──────────────────────────────────────────────────────────────
-for k, v in {
-    "authenticated": False, "user_email": None, "creds_json": None,
-    "assistant": None, "show_ai": False,
-    "oauth_step": 0,   # 0=idle  1=waiting for URL paste
-    "_auth_url": None, "_oauth_port": None,
-    "emails": [], "calendar_events": [], "conflicts": [],
-    "workflow_result": None,
-    "current_view": "dashboard", "selected_email": None, "_etab": "all",
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+MEMORY_DIR = 'memory'
+MEMORY_FILE = os.path.join(MEMORY_DIR, 'conversation_memory.pkl')
 
-# ══════════════════════════════════════════════════════════════════════════════
-# OAUTH
-# ══════════════════════════════════════════════════════════════════════════════
 
-def _free_port():
-    with socket.socket() as s:
-        s.bind(("localhost", 0))
-        return s.getsockname()[1]
+# ============================================================================
+# OAUTH HELPERS (Streamlit Cloud — no credentials.json, no local server)
+# ============================================================================
 
-def _load_cfg():
-    if not os.path.exists(CREDS_FILE): return None
+def _get_client_config() -> dict:
+    """
+    Build the OAuth client config dict from Streamlit secrets.
+    Falls back to environment variables so local dev still works.
+
+    Expected Streamlit secret keys (under [google_credentials]):
+        client_id, client_secret
+    """
     try:
-        with open(CREDS_FILE) as f: return json.load(f)
-    except: return None
+        client_id     = st.secrets["google_credentials"]["client_id"]
+        client_secret = st.secrets["google_credentials"]["client_secret"]
+    except (KeyError, FileNotFoundError):
+        # Fallback: env vars (useful for local testing with a .env file)
+        client_id     = os.getenv("GOOGLE_CLIENT_ID", "")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
-def _make_flow(port):
-    cfg = _load_cfg()
-    if not cfg: return None
-    return Flow.from_client_config(cfg, scopes=SCOPES,
-                                   redirect_uri=f"http://localhost:{port}")
+    if not client_id or not client_secret:
+        st.error(
+            "❌ Google OAuth credentials not found.  \n"
+            "Add `client_id` and `client_secret` under `[google_credentials]` "
+            "in your Streamlit Cloud secrets."
+        )
+        st.stop()
 
-def _build_auth_url(port):
-    flow = _make_flow(port)
-    if not flow: return None
-    url, _ = flow.authorization_url(access_type="offline",
-                                    include_granted_scopes="true", prompt="consent")
-    return url
+    return {
+        "web": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uris": [REDIRECT_URI],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
 
-def _extract_code(pasted: str):
-    """Pull the auth code out of a pasted redirect URL (or bare code)."""
-    pasted = pasted.strip()
-    if not pasted: return None
-    if pasted.startswith("http"):
-        qs = parse_qs(urlparse(pasted).query)
-        return qs.get("code", [None])[0]
-    return pasted   # treat as bare code
 
-def _exchange(port, code):
-    try:
-        flow = _make_flow(port)
-        if not flow: return None
-        flow.fetch_token(code=code)
-        return flow.credentials
-    except Exception as e:
-        st.error(f"❌ Token exchange failed: {e}")
+def get_oauth_flow() -> Flow:
+    """Return a configured google_auth_oauthlib Flow."""
+    return Flow.from_client_config(
+        _get_client_config(),
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+    )
+
+
+def handle_google_auth() -> Optional[Credentials]:
+    """
+    Full browser-based OAuth dance for Streamlit Cloud.
+
+    Flow:
+      1. User lands on app  → show "Sign in with Google" button
+      2. User clicks button → redirect to Google consent screen
+      3. Google redirects   → back to APP_URL with ?code=...
+      4. We exchange code   → store Credentials in st.session_state
+      5. Every subsequent   → reuse session credentials (refresh if expired)
+
+    Returns a valid Credentials object, or None if not yet authenticated.
+    """
+
+    # ── Already authenticated in this session? ──────────────────────────────
+    if "google_creds_token" in st.session_state:
+        creds = _creds_from_session()
+        if creds and creds.valid:
+            return creds
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                _save_creds_to_session(creds)
+                return creds
+            except Exception:
+                pass  # fall through to re-auth
+
+    # ── Returning from Google with ?code= in the URL ─────────────────────────
+    params = st.query_params
+    if "code" in params:
+        code = params["code"]
+        try:
+            flow = get_oauth_flow()
+            flow.fetch_token(code=code)
+            creds = flow.credentials
+            _save_creds_to_session(creds)
+            # Remove the code from the URL so refresh doesn't re-use it
+            st.query_params.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"OAuth token exchange failed: {e}")
         return None
 
-def _save_creds(c): st.session_state.creds_json = c.to_json()
+    # ── Not authenticated yet — show login UI ────────────────────────────────
+    flow = get_oauth_flow()
+    auth_url, _ = flow.authorization_url(
+        prompt="consent",
+        access_type="offline",
+        include_granted_scopes="true",
+    )
 
-def _load_creds():
-    raw = st.session_state.creds_json
-    if not raw: return None
-    try:
-        c = Credentials.from_authorized_user_info(json.loads(raw), SCOPES)
-        if c.expired and c.refresh_token:
-            c.refresh(Request()); _save_creds(c)
-        return c
-    except: return None
+    st.markdown(
+        """
+        <div style='text-align:center; padding: 60px 20px;'>
+            <h1>📬 Ambient Email Assistant</h1>
+            <p style='font-size:18px; color:#555;'>
+                Connect your Google account to get started.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    col1, col2, col3 = st.columns([2, 1, 2])
+    with col2:
+        st.link_button("🔐 Sign in with Google", auth_url, use_container_width=True)
 
-def _get_email(c):
-    try:
-        r = http_req.get("https://www.googleapis.com/oauth2/v2/userinfo",
-                         headers={"Authorization": f"Bearer {c.token}"}, timeout=5)
-        return r.json().get("email") if r.ok else None
-    except: return None
+    st.info(
+        "This app uses read/write access to Gmail and Google Calendar "
+        "to analyse emails, detect scheduling conflicts, and draft replies."
+    )
+    return None
 
-def _connect(c):
-    try:
-        a = EnhancedEmailAssistant()
-        if not a.inject_credentials(c):
-            st.error("❌ Could not connect. Try signing in again."); return False
-        st.session_state.assistant = a
-        st.session_state.authenticated = True
+
+def _save_creds_to_session(creds: Credentials):
+    """Persist credentials fields (JSON-serialisable) in session_state."""
+    st.session_state["google_creds_token"] = {
+        "token":         creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri":     creds.token_uri,
+        "client_id":     creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes":        list(creds.scopes) if creds.scopes else SCOPES,
+        "expiry":        creds.expiry.isoformat() if creds.expiry else None,
+    }
+
+
+def _creds_from_session() -> Optional[Credentials]:
+    """Re-hydrate a Credentials object from session_state."""
+    data = st.session_state.get("google_creds_token")
+    if not data:
+        return None
+    expiry = datetime.fromisoformat(data["expiry"]) if data.get("expiry") else None
+    return Credentials(
+        token=data["token"],
+        refresh_token=data["refresh_token"],
+        token_uri=data["token_uri"],
+        client_id=data["client_id"],
+        client_secret=data["client_secret"],
+        scopes=data["scopes"],
+        expiry=expiry,
+    )
+
+
+# ============================================================================
+# DATA MODELS
+# ============================================================================
+
+@dataclass
+class EmailData:
+    """Email data model"""
+    id: str
+    thread_id: str
+    subject: str
+    sender: str
+    recipient: str
+    timestamp: datetime
+    body: str
+    snippet: str
+    is_unread: bool = False
+    is_important: bool = False
+    has_attachment: bool = False
+    has_calendar_event: bool = False
+    sender_email: str = ""
+    labels: List[str] = field(default_factory=list)
+
+    # AI-enhanced fields
+    category: Optional[str] = None
+    priority_score: Optional[int] = None
+    sentiment: Optional[str] = None
+    extracted_dates: List[str] = field(default_factory=list)
+    action_items: List[str] = field(default_factory=list)
+
+    def __str__(self):
+        return f"Email(subject='{self.subject}', from='{self.sender}', date={self.timestamp})"
+
+
+@dataclass
+class CalendarEvent:
+    """Calendar event data model"""
+    id: str
+    summary: str
+    start_time: datetime
+    end_time: datetime
+    description: Optional[str] = None
+    location: Optional[str] = None
+    attendees: List[str] = field(default_factory=list)
+    organizer: Optional[str] = None
+    status: str = "confirmed"
+    start: datetime = field(init=False, repr=False)
+    end: datetime = field(init=False, repr=False)
+    title: str = field(init=False, repr=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, 'start', self.start_time)
+        object.__setattr__(self, 'end', self.end_time)
+        object.__setattr__(self, 'title', self.summary)
+
+    @property
+    def duration_minutes(self) -> int:
+        return int((self.end_time - self.start_time).total_seconds() / 60)
+
+    def __str__(self):
+        return f"Event('{self.summary}', {self.start_time} - {self.end_time})"
+
+
+@dataclass
+class ConflictInfo:
+    """Calendar conflict information"""
+    event1: CalendarEvent
+    event2: CalendarEvent
+    overlap_start: datetime
+    overlap_end: datetime
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    @property
+    def overlap_minutes(self) -> int:
+        return int((self.overlap_end - self.overlap_start).total_seconds() / 60)
+
+    def __str__(self):
+        return f"Conflict: '{self.event1.summary}' vs '{self.event2.summary}' ({self.overlap_minutes} min)"
+
+
+# ============================================================================
+# GMAIL SERVICE
+# ============================================================================
+
+class GmailService:
+    """Gmail API service wrapper"""
+
+    def __init__(self):
+        self.service = None
+        self.creds = None
+
+    def inject_credentials(self, creds: Credentials) -> bool:
+        """Receive credentials from browser OAuth — no file I/O."""
         try:
-            from dotenv import load_dotenv; load_dotenv()
-            key = os.getenv("OPENAI_API_KEY")
-            if key: a.initialize_llm(api_key=key); st.session_state.show_ai = True
-        except: pass
-        return True
-    except Exception as e:
-        st.error(f"❌ {e}"); return False
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            self.creds = creds
+            self.service = build('gmail', 'v1', credentials=self.creds)
+            return True
+        except Exception as e:
+            print(f"GmailService.inject_credentials: {e}")
+            return False
 
-# Auto-restore on refresh
-if not st.session_state.authenticated and st.session_state.creds_json:
-    _c = _load_creds()
-    if _c: _connect(_c)
-
-# ── Data helpers ───────────────────────────────────────────────────────────────
-def fetch_emails(n=50, q=""):
-    with st.spinner(f"Fetching {n} emails…"):
+    def get_emails(self, query: str = "", max_results: int = 50) -> List[EmailData]:
+        if not self.service:
+            return []
         try:
-            e = st.session_state.assistant.fetch_emails(max_results=n, query=q)
-            st.session_state.emails = e; return e
-        except Exception as ex: st.error(f"❌ {ex}"); return []
+            results = self.service.users().messages().list(
+                userId='me', q=query, maxResults=max_results
+            ).execute()
+            messages = results.get('messages', [])
+            emails = []
+            for msg in messages:
+                email = self._parse_message(msg['id'])
+                if email:
+                    emails.append(email)
+            return emails
+        except HttpError as error:
+            print(f'Gmail API error: {error}')
+            return []
 
-def fetch_cal(days=30):
-    with st.spinner("Fetching calendar…"):
+    def _parse_message(self, msg_id: str) -> Optional[EmailData]:
         try:
-            ev = st.session_state.assistant.fetch_calendar_events(days_ahead=days)
-            st.session_state.calendar_events = ev; return ev
-        except Exception as ex: st.error(f"❌ {ex}"); return []
+            message = self.service.users().messages().get(
+                userId='me', id=msg_id, format='full'
+            ).execute()
 
-def detect_conflicts():
-    with st.spinner("Detecting conflicts…"):
-        try:
-            c = st.session_state.assistant.detect_conflicts(st.session_state.calendar_events)
-            st.session_state.conflicts = c; return c
-        except Exception as ex: st.error(f"❌ {ex}"); return []
+            headers = message['payload']['headers']
+            subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), 'No Subject')
+            sender  = next((h['value'] for h in headers if h['name'].lower() == 'from'),    'Unknown')
+            recipient = next((h['value'] for h in headers if h['name'].lower() == 'to'),    'Unknown')
+            date_str  = next((h['value'] for h in headers if h['name'].lower() == 'date'),  None)
 
-def run_wf():
-    with st.spinner("Running AI workflow…"):
-        try:
-            pb = st.progress(0); pb.progress(20)
-            r = st.session_state.assistant.run_ambient_agent(thread_id="st-session")
-            pb.progress(100); pb.empty()
-            st.session_state.workflow_result = r
-            if r.get("emails"):          st.session_state.emails          = r["emails"]
-            if r.get("calendar_events"): st.session_state.calendar_events = r["calendar_events"]
-            if r.get("conflicts"):       st.session_state.conflicts       = r["conflicts"]
-            return r
-        except Exception as ex: st.error(f"❌ {ex}"); return None
+            sender_email = self._extract_email_address(sender)
+            timestamp    = self._parse_date(date_str) if date_str else datetime.now()
+            body         = self._get_message_body(message)
+            snippet      = message.get('snippet', '')
+            labels       = message.get('labelIds', [])
+            is_unread    = 'UNREAD' in labels
+            is_important = 'IMPORTANT' in labels or 'STARRED' in labels
+            has_attachment    = self._has_attachments(message)
+            has_calendar_event = self._detect_calendar_event(body, subject)
 
-def _filt(emails, t):
-    if t=="unread":    return [e for e in emails if e.is_unread]
-    if t=="important": return [e for e in emails if e.is_important]
-    if t=="calendar":  return [e for e in emails if e.has_calendar_event]
-    return emails
-
-def _sort(emails, k):
-    if k=="asc":    return sorted(emails, key=lambda e: e.timestamp)
-    if k=="sender": return sorted(emails, key=lambda e: e.sender)
-    if k=="pri":    return sorted(emails, key=lambda e: e.priority_score or 0, reverse=True)
-    return sorted(emails, key=lambda e: e.timestamp, reverse=True)
-
-def _b(t, c): return f'<span class="badge {c}">{t}</span>'
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.markdown('<h2 style="text-align:center;">📧 AI Email Assistant</h2>',
-                unsafe_allow_html=True)
-    st.markdown("---")
-    st.subheader("🔐 Your Account")
-
-    if not st.session_state.authenticated:
-
-        if _load_cfg() is None:
-            st.markdown('<div class="er">❌ <strong>credentials.json not found</strong></div>',
-                        unsafe_allow_html=True)
-
-        # STEP 0 ── show Connect button
-        elif st.session_state.oauth_step == 0:
-            st.markdown('<div class="wn">Sign in with <strong>any Google account</strong>.<br>'
-                        '<small>Token never stored on disk.</small></div>',
-                        unsafe_allow_html=True)
-            if st.button("🔑 Connect to Gmail", use_container_width=True, type="primary"):
-                port = _free_port()
-                url  = _build_auth_url(port)
-                if url:
-                    st.session_state._auth_url   = url
-                    st.session_state._oauth_port = port
-                    st.session_state.oauth_step  = 1
-                    st.rerun()
-                else:
-                    st.error("Could not build auth URL — check credentials.json.")
-
-        # STEP 1 ── show link + URL paste box
-        elif st.session_state.oauth_step == 1:
-            url  = st.session_state._auth_url  or ""
-            port = st.session_state._oauth_port
-
-            st.markdown(f"""
-            <div class="ob">
-              <b>Step 1 — Open Google sign-in:</b><br><br>
-              <a href="{url}" target="_blank"
-                 style="color:#00B8D4;font-weight:600;font-size:1rem;">
-                🔗 Click here to sign in with Google
-              </a><br><br>
-              <small style="color:#A3A3A3;">
-                Sign in with any Google account, click <em>Allow</em>.
-              </small>
-            </div>""", unsafe_allow_html=True)
-
-            st.markdown("""
-            <div class="ob">
-              <b>Step 2 — Paste the redirect URL:</b><br>
-              <small style="color:#A3A3A3;">
-                After clicking Allow, your browser will show<br>
-                <b style="color:#FFB800;">"This site can't be reached"</b> — that's normal!<br><br>
-                Copy the <b>full URL</b> from your address bar<br>
-                (starts with <code>http://localhost:PORT/?...code=...</code>)<br>
-                and paste it below.
-              </small>
-            </div>""", unsafe_allow_html=True)
-
-            pasted = st.text_input(
-                "Redirect URL:",
-                placeholder="http://localhost:58518/?state=...&code=4/0Afr...",
-                key="pasted_url",
+            return EmailData(
+                id=msg_id,
+                thread_id=message['threadId'],
+                subject=subject,
+                sender=sender,
+                recipient=recipient,
+                timestamp=timestamp,
+                body=body,
+                snippet=snippet,
+                is_unread=is_unread,
+                is_important=is_important,
+                has_attachment=has_attachment,
+                has_calendar_event=has_calendar_event,
+                sender_email=sender_email,
+                labels=labels,
             )
+        except Exception as e:
+            print(f"Error parsing message {msg_id}: {e}")
+            return None
 
-            ca, cb = st.columns(2)
-            with ca:
-                if st.button("✅ Connect", use_container_width=True, type="primary"):
-                    code = _extract_code(pasted)
-                    if code:
-                        with st.spinner("Connecting…"):
-                            creds = _exchange(port, code)
-                        if creds:
-                            _save_creds(creds)
-                            st.session_state.user_email = _get_email(creds)
-                            st.session_state.oauth_step = 0
-                            if _connect(creds):
-                                st.success("✅ Connected!")
-                                st.rerun()
-                    else:
-                        st.warning("Paste the full redirect URL first.")
-            with cb:
-                if st.button("↩ Cancel", use_container_width=True):
-                    st.session_state.oauth_step = 0; st.rerun()
+    def _detect_calendar_event(self, body: str, subject: str) -> bool:
+        keywords = [
+            'meeting', 'calendar', 'event', 'invited', 'invitation',
+            'scheduled', 'appointment', 'conference', 'zoom', 'teams',
+            'when:', 'where:', 'time:', 'date:', 'rsvp',
+        ]
+        body_lower    = body.lower()
+        subject_lower = subject.lower()
+        return any(kw in body_lower or kw in subject_lower for kw in keywords)
 
-    else:
-        lbl = st.session_state.user_email or "Google Account"
-        st.markdown(f'<div class="ok">✅ <strong>Connected</strong><br>'
-                    f'<small style="color:#A3A3A3;">{lbl}</small></div>',
-                    unsafe_allow_html=True)
-        if st.session_state.show_ai:
-            st.markdown('<div class="ok">🤖 <strong>AI features on</strong></div>',
-                        unsafe_allow_html=True)
+    def _extract_email_address(self, sender: str) -> str:
+        match = re.search(r'<([^>]+)>', sender)
+        if match:
+            return match.group(1)
+        match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', sender)
+        if match:
+            return match.group(0)
+        return sender
+
+    def _get_message_body(self, message: Dict) -> str:
+        try:
+            parts = message['payload'].get('parts', [])
+            if not parts:
+                body_data = message['payload'].get('body', {}).get('data', '')
+                if body_data:
+                    return base64.urlsafe_b64decode(body_data).decode('utf-8', errors='ignore')
+            for part in parts:
+                if part['mimeType'] == 'text/plain':
+                    body_data = part.get('body', {}).get('data', '')
+                    if body_data:
+                        return base64.urlsafe_b64decode(body_data).decode('utf-8', errors='ignore')
+            for part in parts:
+                if part['mimeType'] == 'text/html':
+                    body_data = part.get('body', {}).get('data', '')
+                    if body_data:
+                        html = base64.urlsafe_b64decode(body_data).decode('utf-8', errors='ignore')
+                        return re.sub('<[^<]+?>', '', html)
+            return message.get('snippet', '')
+        except Exception as e:
+            print(f"Error extracting body: {e}")
+            return message.get('snippet', '')
+
+    def _has_attachments(self, message: Dict) -> bool:
+        parts = message['payload'].get('parts', [])
+        return any(part.get('filename') for part in parts)
+
+    def _parse_date(self, date_str: str) -> datetime:
+        try:
+            from email.utils import parsedate_to_datetime
+            return parsedate_to_datetime(date_str)
+        except Exception:
+            return datetime.now()
+
+    def send_email(self, to: str, subject: str, body: str,
+                   thread_id: Optional[str] = None) -> bool:
+        if not self.service:
+            return False
+        try:
+            message = MIMEText(body)
+            message['to'] = to
+            message['subject'] = subject
+            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+            send_message = {'raw': raw_message}
+            if thread_id:
+                send_message['threadId'] = thread_id
+            self.service.users().messages().send(userId='me', body=send_message).execute()
+            return True
+        except HttpError as error:
+            print(f'Error sending email: {error}')
+            return False
+
+    def create_draft(self, to: str, subject: str, body: str) -> bool:
+        if not self.service:
+            return False
+        try:
+            message = MIMEText(body)
+            message['to'] = to
+            message['subject'] = subject
+            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+            self.service.users().drafts().create(
+                userId='me',
+                body={'message': {'raw': raw_message}}
+            ).execute()
+            return True
+        except HttpError as error:
+            print(f'Error creating draft: {error}')
+            return False
+
+
+# ============================================================================
+# CALENDAR SERVICE
+# ============================================================================
+
+class CalendarService:
+    """Google Calendar API service wrapper"""
+
+    def __init__(self):
+        self.service = None
+        self.creds = None
+
+    def inject_credentials(self, creds: Credentials) -> bool:
+        """Receive credentials from browser OAuth — no file I/O."""
+        try:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            self.creds = creds
+            self.service = build('calendar', 'v3', credentials=self.creds)
+            return True
+        except Exception as e:
+            print(f"CalendarService.inject_credentials: {e}")
+            return False
+
+    def get_events(self, days_ahead: int = 30) -> List[CalendarEvent]:
+        if not self.service:
+            return []
+        try:
+            now      = datetime.utcnow()
+            time_min = now.isoformat() + 'Z'
+            time_max = (now + timedelta(days=days_ahead)).isoformat() + 'Z'
+            result   = self.service.events().list(
+                calendarId='primary',
+                timeMin=time_min,
+                timeMax=time_max,
+                maxResults=100,
+                singleEvents=True,
+                orderBy='startTime',
+            ).execute()
+            return [e for e in (self._parse_event(ev) for ev in result.get('items', [])) if e]
+        except HttpError as error:
+            print(f'Calendar API error: {error}')
+            return []
+
+    def _parse_event(self, event: Dict) -> Optional[CalendarEvent]:
+        try:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            end   = event['end'].get('dateTime',   event['end'].get('date'))
+            start_time = datetime.fromisoformat(start.replace('Z', '+00:00'))
+            end_time   = datetime.fromisoformat(end.replace('Z',   '+00:00'))
+            attendees  = [a.get('email', '') for a in event.get('attendees', [])]
+            return CalendarEvent(
+                id=event['id'],
+                summary=event.get('summary', 'No Title'),
+                start_time=start_time,
+                end_time=end_time,
+                description=event.get('description'),
+                location=event.get('location'),
+                attendees=attendees,
+                organizer=event.get('organizer', {}).get('email'),
+                status=event.get('status', 'confirmed'),
+            )
+        except Exception as e:
+            print(f"Error parsing event: {e}")
+            return None
+
+    def find_conflicts(self, events: List[CalendarEvent]) -> List[ConflictInfo]:
+        conflicts = []
+        for i, e1 in enumerate(events):
+            for e2 in events[i + 1:]:
+                if e1.start_time < e2.end_time and e2.start_time < e1.end_time:
+                    conflicts.append(ConflictInfo(
+                        event1=e1,
+                        event2=e2,
+                        overlap_start=max(e1.start_time, e2.start_time),
+                        overlap_end=min(e1.end_time, e2.end_time),
+                    ))
+        return conflicts
+
+    def find_free_slots(self, events: List[CalendarEvent],
+                        duration_minutes: int = 60,
+                        days_ahead: int = 7) -> List[Dict[str, Any]]:
+        free_slots = []
+        try:
+            now        = datetime.now()
+            search_end = now + timedelta(days=days_ahead)
+
+            # Build a list of (start, end) tuples for blocking
+            future_events = []
+            for ev in (events or []):
+                s = ev.start_time.replace(tzinfo=None) if ev.start_time.tzinfo else ev.start_time
+                e = ev.end_time.replace(tzinfo=None)   if ev.end_time.tzinfo   else ev.end_time
+                if e > now and s < search_end:
+                    future_events.append((s, e))
+
+            # Start scanning from the next 30-min boundary inside business hours
+            if now.hour >= 20:
+                current = (now + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+            elif now.hour < 8:
+                current = now.replace(hour=8, minute=0, second=0, microsecond=0)
+            else:
+                mins = (now.minute // 30 + 1) * 30
+                if mins >= 60:
+                    current = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+                else:
+                    current = now.replace(minute=mins, second=0, microsecond=0)
+
+            iterations = 0
+            while current < search_end and iterations < 1000:
+                iterations += 1
+                slot_end = current + timedelta(minutes=duration_minutes)
+
+                if current.hour < 8:
+                    current = current.replace(hour=8, minute=0, second=0, microsecond=0)
+                    continue
+                if current.hour >= 20:
+                    current = (current + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+                    continue
+
+                is_free = all(
+                    not (current < ev_end and slot_end > ev_start)
+                    for ev_start, ev_end in future_events
+                )
+
+                if is_free and current > now:
+                    free_slots.append({
+                        'start': current,
+                        'end': slot_end,
+                        'duration_minutes': duration_minutes,
+                    })
+
+                if len(free_slots) >= 20:
+                    break
+
+                current += timedelta(minutes=30)
+
+            return free_slots
+        except Exception as e:
+            print(f"Error finding free slots: {e}")
+            return []
+
+
+# ============================================================================
+# AI ANALYZER
+# ============================================================================
+
+class AIAnalyzer:
+    """AI-powered email and calendar analysis"""
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.getenv('OPENAI_API_KEY')
+        self.llm = None
+        if LANGCHAIN_AVAILABLE and self.api_key:
+            try:
+                self.llm = ChatOpenAI(
+                    model=os.getenv('LLM_MODEL', 'gpt-4'),
+                    temperature=float(os.getenv('LLM_TEMPERATURE', '0.7')),
+                    api_key=self.api_key,
+                )
+            except Exception as e:
+                print(f"Error initializing LLM: {e}")
+
+    def analyze_email(self, email: EmailData) -> EmailData:
+        if not self.llm:
+            return self._rule_based_analysis(email)
+        try:
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are an email analysis assistant. Analyse the email and provide:
+1. Category (work, personal, urgent, spam, newsletter)
+2. Priority score (0-10, where 10 is most important)
+3. Sentiment (positive, neutral, negative)
+4. Extracted dates (if any)
+5. Action items (if any)
+
+Respond in this exact format:
+Category: <category>
+Priority: <score>
+Sentiment: <sentiment>
+Dates: <comma-separated dates or "none">
+Actions: <comma-separated actions or "none">
+"""),
+                ("human", "Subject: {subject}\nFrom: {sender}\nBody: {body}"),
+            ])
+            chain    = prompt | self.llm
+            response = chain.invoke({
+                "subject": email.subject,
+                "sender":  email.sender,
+                "body":    email.body[:1000],
+            })
+            for line in response.content.strip().split('\n'):
+                if line.startswith('Category:'):
+                    email.category = line.split(':', 1)[1].strip().lower()
+                elif line.startswith('Priority:'):
+                    try:
+                        email.priority_score = int(line.split(':', 1)[1].strip())
+                    except Exception:
+                        email.priority_score = 5
+                elif line.startswith('Sentiment:'):
+                    email.sentiment = line.split(':', 1)[1].strip().lower()
+                elif line.startswith('Dates:'):
+                    dates = line.split(':', 1)[1].strip()
+                    if dates.lower() != 'none':
+                        email.extracted_dates = [d.strip() for d in dates.split(',')]
+                elif line.startswith('Actions:'):
+                    actions = line.split(':', 1)[1].strip()
+                    if actions.lower() != 'none':
+                        email.action_items = [a.strip() for a in actions.split(',')]
+            return email
+        except Exception as e:
+            print(f"AI analysis error: {e}")
+            return self._rule_based_analysis(email)
+
+    def _rule_based_analysis(self, email: EmailData) -> EmailData:
+        body_lower    = email.body.lower()
+        subject_lower = email.subject.lower()
+
+        if any(w in body_lower or w in subject_lower for w in ['meeting', 'project', 'deadline', 'task']):
+            email.category = 'work'
+        elif any(w in body_lower or w in subject_lower for w in ['urgent', 'asap', 'important', 'critical']):
+            email.category = 'urgent'
+        elif any(w in body_lower or w in subject_lower for w in ['unsubscribe', 'newsletter', 'promotion']):
+            email.category = 'newsletter'
         else:
-            st.markdown('<div class="wn">⚠️ <strong>AI off</strong> — add OPENAI_API_KEY to .env</div>',
-                        unsafe_allow_html=True)
+            email.category = 'personal'
 
-        if st.button("🚪 Sign Out", use_container_width=True):
-            for k in list(st.session_state.keys()): del st.session_state[k]
+        if email.is_important or email.category == 'urgent':
+            email.priority_score = 9
+        elif email.category == 'work':
+            email.priority_score = 7
+        elif email.category == 'newsletter':
+            email.priority_score = 3
+        else:
+            email.priority_score = 5
+
+        pos = sum(1 for w in ['thank', 'great', 'excellent', 'congratulations'] if w in body_lower)
+        neg = sum(1 for w in ['sorry', 'problem', 'issue', 'error', 'cancel'] if w in body_lower)
+        email.sentiment = 'positive' if pos > neg else ('negative' if neg > pos else 'neutral')
+        return email
+
+    def generate_conflict_resolution_email(self, conflict: ConflictInfo,
+                                            alternative_times: List[Tuple[datetime, datetime]]) -> str:
+        if not self.llm:
+            return self._template_conflict_email(conflict, alternative_times)
+        try:
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are a professional email assistant. Write a polite email to resolve a calendar conflict.
+Include: acknowledgment, conflict details, suggested alternatives, request for confirmation.
+Keep it professional and concise."""),
+                ("human", """Conflict:
+Meeting 1: {event1_summary} ({event1_time})
+Meeting 2: {event2_summary} ({event2_time})
+Overlap: {overlap_minutes} minutes
+
+Alternative times:
+{alternatives}
+
+Write the email:"""),
+            ])
+            alt_text = "\n".join([
+                f"- {s.strftime('%B %d, %Y at %I:%M %p')} - {e.strftime('%I:%M %p')}"
+                for s, e in alternative_times[:3]
+            ])
+            chain    = prompt | self.llm
+            response = chain.invoke({
+                "event1_summary":  conflict.event1.summary,
+                "event1_time":     conflict.event1.start_time.strftime('%B %d at %I:%M %p'),
+                "event2_summary":  conflict.event2.summary,
+                "event2_time":     conflict.event2.start_time.strftime('%B %d at %I:%M %p'),
+                "overlap_minutes": conflict.overlap_minutes,
+                "alternatives":    alt_text,
+            })
+            return response.content
+        except Exception as e:
+            print(f"Error generating email: {e}")
+            return self._template_conflict_email(conflict, alternative_times)
+
+    def _template_conflict_email(self, conflict: ConflictInfo,
+                                  alternative_times: List[Tuple[datetime, datetime]]) -> str:
+        body = (
+            f"Subject: Calendar Conflict — {conflict.event1.summary} and {conflict.event2.summary}\n\n"
+            f"Dear Team,\n\n"
+            f"I wanted to flag a scheduling conflict that has come up.\n\n"
+            f"CONFLICT DETAILS:\n"
+            f"• Meeting 1: {conflict.event1.summary}\n"
+            f"  Time: {conflict.event1.start_time.strftime('%B %d, %Y at %I:%M %p')} — "
+            f"{conflict.event1.end_time.strftime('%I:%M %p')}\n\n"
+            f"• Meeting 2: {conflict.event2.summary}\n"
+            f"  Time: {conflict.event2.start_time.strftime('%B %d, %Y at %I:%M %p')} — "
+            f"{conflict.event2.end_time.strftime('%I:%M %p')}\n\n"
+            f"These meetings overlap by {conflict.overlap_minutes} minutes.\n\n"
+            f"ALTERNATIVE TIMES:\n"
+        )
+        for i, (s, e) in enumerate(alternative_times[:3], 1):
+            body += f"{i}. {s.strftime('%B %d, %Y at %I:%M %p')} — {e.strftime('%I:%M %p')}\n"
+        body += (
+            "\nCould you please let me know which time works best, "
+            "or suggest another?\n\nThank you for your flexibility.\n\nBest regards\n"
+        )
+        return body
+
+
+# ============================================================================
+# ENHANCED EMAIL ASSISTANT
+# ============================================================================
+
+class EnhancedEmailAssistant:
+    """Main assistant class — no file-based auth, credentials injected externally."""
+
+    def __init__(self):
+        self.gmail    = GmailService()
+        self.calendar = CalendarService()
+        self.analyzer = AIAnalyzer()
+        self.llm      = None
+
+        self.conversation_memory: List = []
+        self._load_memory()
+
+        self.emails_cache:    List[EmailData]    = []
+        self.events_cache:    List[CalendarEvent] = []
+        self.conflicts_cache: List[ConflictInfo]  = []
+
+    # ── Auth ─────────────────────────────────────────────────────────────────
+
+    def inject_credentials(self, creds: Credentials) -> bool:
+        """Inject Google OAuth credentials into both services."""
+        ok_gmail    = self.gmail.inject_credentials(creds)
+        ok_calendar = self.calendar.inject_credentials(creds)
+        return ok_gmail and ok_calendar
+
+    # ── LLM ──────────────────────────────────────────────────────────────────
+
+    def initialize_llm(self, api_key: Optional[str] = None) -> bool:
+        if api_key:
+            self.analyzer = AIAnalyzer(api_key=api_key)
+            self.llm      = self.analyzer.llm
+        return self.llm is not None
+
+    # ── Memory ───────────────────────────────────────────────────────────────
+
+    def _load_memory(self):
+        os.makedirs(MEMORY_DIR, exist_ok=True)
+        if os.path.exists(MEMORY_FILE):
+            try:
+                with open(MEMORY_FILE, 'rb') as f:
+                    self.conversation_memory = pickle.load(f)
+            except Exception:
+                self.conversation_memory = []
+
+    def _save_memory(self):
+        try:
+            with open(MEMORY_FILE, 'wb') as f:
+                pickle.dump(self.conversation_memory[-100:], f)
+        except Exception as e:
+            print(f"Error saving memory: {e}")
+
+    # ── Email ─────────────────────────────────────────────────────────────────
+
+    def fetch_emails(self, query: str = "", max_results: int = 50) -> List[EmailData]:
+        self.emails_cache = self.gmail.get_emails(query, max_results)
+        return self.emails_cache
+
+    def analyze_emails(self, emails: Optional[List[EmailData]] = None) -> List[EmailData]:
+        target   = emails or self.emails_cache
+        analyzed = [self.analyzer.analyze_email(e) for e in target]
+        if not emails:
+            self.emails_cache = analyzed
+        return analyzed
+
+    def categorize_emails_ai(self, emails: Optional[List[EmailData]] = None) -> List[EmailData]:
+        return self.analyze_emails(emails)
+
+    # ── Calendar ──────────────────────────────────────────────────────────────
+
+    def fetch_calendar_events(self, days_ahead: int = 30) -> List[CalendarEvent]:
+        self.events_cache = self.calendar.get_events(days_ahead)
+        return self.events_cache
+
+    def detect_conflicts(self, events: Optional[List[CalendarEvent]] = None) -> List[ConflictInfo]:
+        self.conflicts_cache = self.calendar.find_conflicts(events or self.events_cache)
+        return self.conflicts_cache
+
+    def find_free_slots(self, *args, **kwargs) -> List[Dict[str, Any]]:
+        """Flexible signature — see docstring for calling patterns."""
+        events           = kwargs.get('events', None)
+        duration_minutes = kwargs.get('duration_minutes', 60)
+        days_ahead       = kwargs.get('days_ahead', 7)
+        refresh_events   = kwargs.get('refresh_events', True)
+
+        if len(args) >= 1:
+            first = args[0]
+            if isinstance(first, list):
+                events = first
+                if len(args) >= 2 and isinstance(args[1], int): duration_minutes = args[1]
+                if len(args) >= 3 and isinstance(args[2], int): days_ahead       = args[2]
+            elif isinstance(first, int):
+                duration_minutes = first
+                if len(args) >= 2 and isinstance(args[1], int): days_ahead = args[1]
+                if len(args) >= 3 and isinstance(args[2], list): events    = args[2]
+
+        if not isinstance(duration_minutes, int): duration_minutes = 60
+        if not isinstance(days_ahead, int):       days_ahead       = 7
+
+        if events is None and refresh_events:
+            self.fetch_calendar_events(days_ahead=days_ahead)
+            events = self.events_cache
+        elif events is None:
+            events = self.events_cache
+
+        return self.calendar.find_free_slots(events, duration_minutes, days_ahead)
+
+    # ── Conflict resolution ───────────────────────────────────────────────────
+
+    def generate_conflict_resolution(self, conflict: ConflictInfo,
+                                     free_slots: Optional[List[Dict[str, Any]]] = None) -> str:
+        if free_slots is None:
+            free_slots = self.find_free_slots(
+                duration_minutes=conflict.event1.duration_minutes, days_ahead=14
+            )
+        alternative_times = [
+            (s['start'], s['end']) if isinstance(s, dict) else s
+            for s in free_slots[:5]
+        ]
+        return self.analyzer.generate_conflict_resolution_email(conflict, alternative_times)
+
+    def generate_conflict_email(self, conflict: ConflictInfo,
+                                free_slots: Optional[List[Dict[str, Any]]] = None) -> str:
+        return self.generate_conflict_resolution(conflict, free_slots)
+
+    def get_conflict_recipients(self, conflict: ConflictInfo) -> List[str]:
+        recipients: set = set()
+        for ev in (conflict.event1, conflict.event2):
+            if ev.organizer: recipients.add(ev.organizer)
+            if ev.attendees: recipients.update(ev.attendees)
+        return [r for r in recipients if r and r.strip()]
+
+    def find_calendar_invitation_email(self, event: CalendarEvent) -> Optional[EmailData]:
+        try:
+            emails = self.gmail.get_emails(query=f'subject:"{event.summary}"', max_results=20)
+            for email in emails:
+                if email.has_calendar_event:
+                    if event.organizer and event.organizer.lower() in email.sender_email.lower():
+                        return email
+                    if event.summary.lower() in email.subject.lower():
+                        return email
+            return None
+        except Exception as e:
+            print(f"Error finding invitation email: {e}")
+            return None
+
+    def get_emails_by_date(self, target_date: datetime) -> List[EmailData]:
+        try:
+            date_str = target_date.strftime('%Y/%m/%d')
+            return self.gmail.get_emails(
+                query=f'after:{date_str} before:{date_str}', max_results=100
+            )
+        except Exception as e:
+            print(f"Error fetching emails by date: {e}")
+            return []
+
+    def send_conflict_resolution_email(self, conflict: ConflictInfo,
+                                       free_slots: Optional[List[Dict[str, Any]]] = None,
+                                       custom_recipients: Optional[List[str]] = None,
+                                       reply_to_invitation: bool = True) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            'success': False, 'recipients': [], 'subject': '',
+            'error': None, 'method': 'draft', 'thread_id': None, 'email_stats': {}
+        }
+        try:
+            base_body = self.generate_conflict_resolution(conflict, free_slots)
+
+            invitation_email = None
+            if reply_to_invitation:
+                invitation_email = (
+                    self.find_calendar_invitation_email(conflict.event1)
+                    or self.find_calendar_invitation_email(conflict.event2)
+                )
+
+            conflict_date  = conflict.event1.start_time
+            emails_on_day  = self.get_emails_by_date(conflict_date)
+            email_count    = len(emails_on_day)
+
+            email_body  = base_body + "\n\n---\n"
+            email_body += f"📊 Email Statistics:\n"
+            email_body += f"• Date: {conflict_date.strftime('%A, %B %d, %Y')}\n"
+            email_body += f"• Total emails received on this day: {email_count}\n"
+            if invitation_email:
+                email_body += f"• This is in reply to: \"{invitation_email.subject}\"\n"
+                email_body += f"• Original invitation from: {invitation_email.sender}\n"
+
+            result['email_stats'] = {
+                'date': conflict_date.strftime('%Y-%m-%d'),
+                'count': email_count,
+                'emails': [
+                    {'subject': e.subject, 'from': e.sender, 'time': e.timestamp.strftime('%I:%M %p')}
+                    for e in emails_on_day[:5]
+                ],
+            }
+
+            if custom_recipients:
+                recipients = custom_recipients
+            elif invitation_email:
+                recipients = [invitation_email.sender_email]
+            else:
+                recipients = self.get_conflict_recipients(conflict)
+
+            if not recipients:
+                result['error'] = "No recipients found. Please specify recipients manually."
+                return result
+
+            if invitation_email:
+                subject   = f"Re: {invitation_email.subject} — Calendar Conflict Resolution"
+                thread_id = invitation_email.thread_id
+                result['thread_id'] = thread_id
+                result['method']    = 'reply'
+            else:
+                subject   = f"Calendar Conflict: {conflict.event1.summary} & {conflict.event2.summary}"
+                thread_id = None
+
+            sent_to = []
+            for recipient in recipients:
+                if invitation_email and thread_id:
+                    if self.send_email(recipient, subject, email_body, thread_id=thread_id):
+                        sent_to.append(recipient)
+                        result['method'] = 'sent_as_reply'
+                else:
+                    if self.create_draft(recipient, subject, email_body):
+                        sent_to.append(recipient)
+
+            result['success']    = len(sent_to) > 0
+            result['recipients'] = sent_to
+            result['subject']    = subject
+            result['message']    = (
+                f"{'Sent reply' if result['method'] == 'sent_as_reply' else 'Draft created'} "
+                f"for {len(sent_to)} recipient(s)"
+            )
+        except Exception as e:
+            result['error'] = str(e)
+            import traceback; traceback.print_exc()
+        return result
+
+    def send_email(self, to: str, subject: str, body: str,
+                   thread_id: Optional[str] = None) -> bool:
+        return self.gmail.send_email(to, subject, body, thread_id)
+
+    def create_draft(self, to: str, subject: str, body: str) -> bool:
+        return self.gmail.create_draft(to, subject, body)
+
+    # ── Ambient agent ─────────────────────────────────────────────────────────
+
+    def run_ambient_agent(self, thread_id: str = "default") -> Dict[str, Any]:
+        result = {
+            'status': 'success', 'emails_fetched': 0, 'emails_analyzed': 0,
+            'events_fetched': 0, 'conflicts_found': 0, 'suggestions': [], 'drafts_created': 0,
+        }
+        try:
+            emails = self.fetch_emails(max_results=50)
+            result['emails_fetched']  = len(emails)
+            analyzed = self.analyze_emails(emails)
+            result['emails_analyzed'] = len(analyzed)
+
+            events = self.fetch_calendar_events(days_ahead=30)
+            result['events_fetched']  = len(events)
+            conflicts = self.detect_conflicts(events)
+            result['conflicts_found'] = len(conflicts)
+
+            suggestions = []
+            urgent   = [e for e in analyzed if e.priority_score and e.priority_score >= 8]
+            if urgent:
+                suggestions.append(f"You have {len(urgent)} high-priority emails requiring attention")
+            unread_imp = [e for e in analyzed if e.is_unread and e.is_important]
+            if unread_imp:
+                suggestions.append(f"You have {len(unread_imp)} unread important emails")
+            if conflicts:
+                suggestions.append(f"Found {len(conflicts)} calendar conflicts that need resolution")
+            today_ev = [e for e in events if e.start_time.date() == datetime.now().date()]
+            if today_ev:
+                suggestions.append(f"You have {len(today_ev)} events scheduled for today")
+            result['suggestions'] = suggestions
+
+            for conflict in conflicts[:3]:
+                self.generate_conflict_resolution(conflict)
+                result['drafts_created'] += 1
+
+            return result
+        except Exception as e:
+            result['status'] = 'error'
+            result['error']  = str(e)
+            return result
+
+
+# ============================================================================
+# STREAMLIT APP ENTRY POINT
+# ============================================================================
+
+def main():
+    st.set_page_config(
+        page_title="Ambient Email Assistant",
+        page_icon="📬",
+        layout="wide",
+    )
+
+    # ── OAuth gate ───────────────────────────────────────────────────────────
+    creds = handle_google_auth()
+    if creds is None:
+        st.stop()  # Login UI already rendered inside handle_google_auth()
+
+    # ── Sign-out button ──────────────────────────────────────────────────────
+    with st.sidebar:
+        st.success("✅ Connected to Google")
+        if st.button("Sign out"):
+            st.session_state.pop("google_creds_token", None)
+            st.query_params.clear()
             st.rerun()
 
+    # ── Build assistant with injected credentials ────────────────────────────
+    if "assistant" not in st.session_state:
+        st.session_state["assistant"] = EnhancedEmailAssistant()
+
+    assistant: EnhancedEmailAssistant = st.session_state["assistant"]
+    assistant.inject_credentials(creds)
+
+    # Optional: OpenAI key for AI features
+    with st.sidebar:
         st.markdown("---")
-        st.subheader("🧭 Navigate")
-        for lbl, vid in [("📊 Dashboard","dashboard"),("📧 Emails","emails"),
-                          ("📅 Calendar","calendar"),("⚠️ Conflicts","conflicts"),
-                          ("✍️ Compose","compose"),("🤖 AI Workflow","workflow")]:
-            bt = "primary" if st.session_state.current_view == vid else "secondary"
-            if st.button(lbl, use_container_width=True, key=f"nav_{vid}", type=bt):
-                st.session_state.current_view = vid; st.rerun()
+        openai_key = st.text_input("OpenAI API key (optional)", type="password",
+                                   help="Enables AI-powered email categorisation and conflict drafts")
+        if openai_key:
+            assistant.initialize_llm(api_key=openai_key)
 
-        st.markdown("---")
-        q1, q2 = st.columns(2)
-        with q1:
-            if st.button("🔄", use_container_width=True, help="Refresh"):
-                fetch_emails(); fetch_cal(); st.rerun()
-        with q2:
-            if st.button("🤖", use_container_width=True, help="AI workflow"):
-                run_wf(); st.rerun()
-        st.markdown("---")
-        st.metric("Emails",    len(st.session_state.emails))
-        st.metric("Events",    len(st.session_state.calendar_events))
-        st.metric("Conflicts", len(st.session_state.conflicts))
+    # ── Main UI ───────────────────────────────────────────────────────────────
+    st.title("📬 Ambient Email Assistant")
 
+    tab_emails, tab_calendar, tab_agent = st.tabs(["📧 Emails", "📅 Calendar", "🤖 Ambient Agent"])
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════════
+    # ── Emails tab ────────────────────────────────────────────────────────────
+    with tab_emails:
+        st.subheader("Your Emails")
+        col_q, col_n, col_btn = st.columns([3, 1, 1])
+        with col_q:
+            query = st.text_input("Search query", placeholder="e.g. is:unread label:important")
+        with col_n:
+            max_results = st.number_input("Max results", min_value=1, max_value=200, value=20)
+        with col_btn:
+            st.write("")
+            fetch_btn = st.button("Fetch Emails", use_container_width=True)
 
-if not st.session_state.authenticated:
-    st.markdown('<h1 class="mhdr">🚀 AI Email Assistant</h1>', unsafe_allow_html=True)
+        if fetch_btn:
+            with st.spinner("Fetching emails…"):
+                emails = assistant.fetch_emails(query=query, max_results=int(max_results))
+            st.success(f"Fetched {len(emails)} emails")
 
-    for col, icon, title, color, desc in zip(
-        st.columns(3),
-        ["📧","📅","🤖"],
-        ["Smart Inbox","Calendar Sync","AI Insights"],
-        ["#00E5A0","#00B8D4","#8B5CF6"],
-        ["Read, search, filter and reply to your Gmail",
-         "Events, conflicts, free slot finder",
-         "Categorise, priority, sentiment & auto-draft"],
-    ):
-        with col:
-            st.markdown(f'<div class="card" style="text-align:center;">'
-                        f'<div style="font-size:3rem;">{icon}</div>'
-                        f'<h3 style="color:{color};">{title}</h3>'
-                        f'<p style="color:#A3A3A3;">{desc}</p></div>',
-                        unsafe_allow_html=True)
-
-    st.markdown("---")
-    L, R = st.columns([2,1])
-    with L:
-        st.markdown('<h2 class="shdr">How to connect</h2>', unsafe_allow_html=True)
-        st.markdown("""
-**1.** Click **"Connect to Gmail"** in the sidebar.
-
-**2.** Click the Google sign-in link that appears. Sign in with any Google account and click **Allow**.
-
-**3.** Your browser will show **"This site can't be reached"** — this is completely normal!
-Google has sent the auth code in the URL. Copy the **full URL** from your browser's address bar.
-
-**4.** Paste that URL into the sidebar text box and click **Connect**.
-        """)
-    with R:
-        st.markdown('<div class="wn"><h4>⚠️ &ldquo;This site can&rsquo;t be reached&rdquo;</h4>'
-                    '<p>This is <strong>expected</strong> &mdash; Google sent the auth code successfully. '
-                    'Copy the URL and paste it back in the sidebar.</p></div>',
-                    unsafe_allow_html=True)
-    st.info("👈 Click **Connect to Gmail** in the sidebar to begin.")
-
-
-elif st.session_state.current_view == "dashboard":
-    st.markdown('<h1 class="mhdr">📊 Dashboard</h1>', unsafe_allow_html=True)
-    emails = st.session_state.emails
-    events = st.session_state.calendar_events
-    cc = len(st.session_state.conflicts)
-    unread = sum(1 for e in emails if e.is_unread)
-    imp = sum(1 for e in emails if e.is_important)
-
-    for col, v, lbl, sub, color in zip(
-        st.columns(4),
-        [len(emails), len(events), cc, imp],
-        ["Total Emails","Cal Events","Conflicts","Important"],
-        [f"{unread} unread","Next 30 days","Needs attention" if cc else "All clear","Starred"],
-        ["#00B8D4","#8B5CF6","#FF6B6B" if cc else "#00E5A0","#FFB800"],
-    ):
-        with col:
-            st.markdown(f'<div class="card"><div style="text-align:center;">'
-                        f'<div class="sv" style="background:linear-gradient(135deg,{color},{color});'
-                        f'-webkit-background-clip:text;">{v}</div>'
-                        f'<div class="sl">{lbl}</div>'
-                        f'<div style="color:{color};font-size:.85rem;">{sub}</div>'
-                        f'</div></div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-    CL, CR = st.columns([2,1])
-    with CL:
-        st.markdown('<h2 class="shdr">📬 Recent Emails</h2>', unsafe_allow_html=True)
-        if emails:
-            for em in emails[:8]:
-                b = ((_b("Unread","bu") if em.is_unread else "") +
-                     (_b("Important","bi") if em.is_important else "") +
-                     (_b("Calendar","bc") if em.has_calendar_event else ""))
-                st.markdown(f'<div class="ecard"><div style="margin-bottom:.4rem;">{b}</div>'
-                            f'<strong>{em.subject}</strong><br>'
-                            f'<small style="color:#00B8D4;">{em.sender}</small> · '
-                            f'<small style="color:#A3A3A3;">{em.timestamp.strftime("%b %d, %I:%M %p")}</small><br>'
-                            f'<p style="color:#A3A3A3;font-size:.9rem;">{em.snippet[:100]}…</p></div>',
-                            unsafe_allow_html=True)
-                if st.button("View →", key=f"dv_{em.id}"):
-                    st.session_state.selected_email = em
-                    st.session_state.current_view = "emails"; st.rerun()
-        else:
-            st.markdown('<div class="wn">📭 No emails — click 🔄 in sidebar to load.</div>',
-                        unsafe_allow_html=True)
-    with CR:
-        st.markdown('<h2 class="shdr">🎯 AI Insights</h2>', unsafe_allow_html=True)
-        wr = st.session_state.workflow_result
-        if wr:
-            for i,s in enumerate(wr.get("suggestions",[])[:5],1):
-                t = s.get("title",s) if isinstance(s,dict) else s
-                st.markdown(f'<div style="background:#1C1C21;padding:.8rem;border-radius:6px;'
-                            f'margin-bottom:.5rem;border-left:3px solid #00E5A0;">'
-                            f'<strong>{i}. {t}</strong></div>', unsafe_allow_html=True)
-        else:
-            if st.button("🚀 Run AI Workflow", use_container_width=True, type="primary"):
-                run_wf(); st.rerun()
-        st.markdown("---")
-        today = datetime.now().date()
-        tevs  = [e for e in events if e.start.date()==today]
-        st.write("**📅 Today**")
-        if tevs:
-            for ev in tevs[:5]:
-                st.markdown(f'<div class="ccard"><strong>{ev.title}</strong><br>'
-                            f'<small>⏰ {ev.start.strftime("%I:%M %p")} – {ev.end.strftime("%I:%M %p")}</small></div>',
-                            unsafe_allow_html=True)
-        else:
-            st.info("No events today.")
-
-
-elif st.session_state.current_view == "emails":
-    st.markdown('<h1 class="mhdr">📧 Email Manager</h1>', unsafe_allow_html=True)
-    s1,s2,s3,s4 = st.columns([2,1,1,1])
-    with s1: q = st.text_input("Search", placeholder="is:unread from:boss@company.com",
-                                label_visibility="collapsed")
-    with s2: n = st.number_input("Max", 10, 200, 50, label_visibility="collapsed")
-    with s3:
-        if st.button("🔄 Fetch", use_container_width=True, type="primary"):
-            fetch_emails(n, q); st.rerun()
-    with s4:
-        if st.button("🤖 Analyse", use_container_width=True):
-            a = st.session_state.assistant
-            if a and getattr(a,"llm",None):
+        if assistant.emails_cache:
+            if st.button("Analyse with AI"):
                 with st.spinner("Analysing…"):
-                    st.session_state.emails = a.categorize_emails_ai(st.session_state.emails)
-                st.rerun()
-            else: st.warning("AI off — add OPENAI_API_KEY to .env")
-    st.markdown("---")
-    t1,t2,t3,t4 = st.tabs(["📬 All","🔵 Unread","⭐ Important","📅 Calendar"])
-    with t1: st.session_state._etab = "all"
-    with t2: st.session_state._etab = "unread"
-    with t3: st.session_state._etab = "important"
-    with t4: st.session_state._etab = "calendar"
-    _, sc = st.columns([4,1])
-    with sc:
-        sl = st.selectbox("Sort",["Date ↓","Date ↑","Sender","Priority"],
-                          label_visibility="collapsed")
-    sm = {"Date ↓":"desc","Date ↑":"asc","Sender":"sender","Priority":"pri"}
-    shown = _sort(_filt(st.session_state.emails, st.session_state._etab), sm[sl])
-    st.write(f"**Showing {len(shown)} emails**")
-    for em in shown:
-        ico  = "🔵" if em.is_unread else "✅"
-        star = "⭐ " if em.is_important else ""
-        shrt = em.subject[:55]+("…" if len(em.subject)>55 else "")
-        with st.expander(f"{ico} {star}{shrt} — {em.sender}", expanded=False):
-            lc, rc = st.columns([3,1])
-            with lc:
-                st.write(f"**From:** {em.sender} ({em.sender_email})")
-                st.write(f"**Date:** {em.timestamp.strftime('%A, %B %d, %Y at %I:%M %p')}")
-                if em.category or em.priority_score or em.sentiment:
-                    ic = st.columns(3)
-                    if em.category:       ic[0].metric("Category", em.category)
-                    if em.priority_score: ic[1].metric("Priority",  f"{em.priority_score}/10")
-                    if em.sentiment:      ic[2].metric("Sentiment", em.sentiment)
-            with rc:
-                if st.button("📧 Reply", key=f"rp_{em.id}", use_container_width=True):
-                    st.session_state.selected_email = em
-                    st.session_state.current_view = "compose"; st.rerun()
-            st.markdown("---")
-            st.text_area("Body", value=em.body, height=250, key=f"bd_{em.id}",
-                         disabled=True, label_visibility="collapsed")
+                    assistant.analyze_emails()
+                st.success("Analysis complete")
 
+            for email in assistant.emails_cache[:50]:
+                with st.expander(f"{'🔴' if email.is_unread else '⚪'} {email.subject}  —  {email.sender}"):
+                    cols = st.columns(4)
+                    cols[0].metric("Category",  email.category  or "—")
+                    cols[1].metric("Priority",  f"{email.priority_score}/10" if email.priority_score else "—")
+                    cols[2].metric("Sentiment", email.sentiment or "—")
+                    cols[3].metric("Date",      email.timestamp.strftime('%b %d'))
+                    st.text_area("Body", email.body[:500], height=100, key=f"body_{email.id}")
+                    if email.action_items:
+                        st.markdown("**Action items:** " + " • ".join(email.action_items))
 
-elif st.session_state.current_view == "calendar":
-    st.markdown('<h1 class="mhdr">📅 Calendar Manager</h1>', unsafe_allow_html=True)
-    c1,c2,c3 = st.columns([2,1,1])
-    with c1: days = st.slider("Days ahead", 7, 90, 30)
-    with c2:
-        if st.button("🔄 Refresh", use_container_width=True, type="primary"):
-            fetch_cal(days); st.rerun()
-    with c3:
-        if st.button("⚠️ Conflicts", use_container_width=True):
-            if not st.session_state.calendar_events: fetch_cal()
-            detect_conflicts(); st.rerun()
-    st.markdown("---")
-    evs = st.session_state.calendar_events
-    if evs:
-        by_d: dict = {}
-        for ev in evs: by_d.setdefault(ev.start.date(),[]).append(ev)
-        for dt in sorted(by_d):
-            st.markdown(f'<h3 style="color:#00B8D4;">📆 {dt.strftime("%A, %B %d, %Y")}</h3>',
-                        unsafe_allow_html=True)
-            for ev in sorted(by_d[dt], key=lambda e: e.start):
-                dur = (ev.end-ev.start).total_seconds()/60
-                st.markdown(f'<div class="ccard"><strong>{ev.title}</strong><br>'
-                            f'<small style="color:#A3A3A3;">⏰ {ev.start.strftime("%I:%M %p")} – {ev.end.strftime("%I:%M %p")} ({dur:.0f} min)</small>'
-                            f'{"<br><small style=color:#8B5CF6;>📍 "+ev.location+"</small>" if ev.location else ""}'
-                            f'</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="wn">📭 No events — click Refresh.</div>', unsafe_allow_html=True)
+    # ── Calendar tab ──────────────────────────────────────────────────────────
+    with tab_calendar:
+        st.subheader("Calendar & Conflicts")
+        days = st.slider("Days ahead", 1, 90, 30)
+        if st.button("Fetch Calendar Events"):
+            with st.spinner("Fetching events…"):
+                events    = assistant.fetch_calendar_events(days_ahead=days)
+                conflicts = assistant.detect_conflicts()
+            st.success(f"Fetched {len(events)} events, {len(conflicts)} conflicts")
 
+        if assistant.events_cache:
+            st.markdown(f"**{len(assistant.events_cache)} upcoming events**")
+            for ev in assistant.events_cache[:20]:
+                st.write(f"- **{ev.summary}** — {ev.start_time.strftime('%b %d %I:%M %p')} → {ev.end_time.strftime('%I:%M %p')}")
 
-elif st.session_state.current_view == "conflicts":
-    st.markdown('<h1 class="mhdr">⚠️ Calendar Conflicts</h1>', unsafe_allow_html=True)
-    _, bc = st.columns([3,1])
-    with bc:
-        if st.button("🔍 Detect", use_container_width=True, type="primary"):
-            if not st.session_state.calendar_events: fetch_cal()
-            detect_conflicts(); st.rerun()
-    st.markdown("---")
-    cfs = st.session_state.conflicts
-    if cfs:
-        st.markdown(f'<div class="er">⚠️ <strong>{len(cfs)} conflict(s) found</strong></div>',
-                    unsafe_allow_html=True)
-        for i,cf in enumerate(cfs,1):
-            st.markdown(f'<h3 style="color:#FF6B6B;">Conflict #{i}</h3>', unsafe_allow_html=True)
-            cl, cr = st.columns(2)
-            for col,ev,color in [(cl,cf["event1"],"#00E5A0"),(cr,cf["event2"],"#FF6B6B")]:
-                with col:
-                    st.markdown(f'<div style="background:#1C1C21;padding:1rem;border-radius:8px;'
-                                f'border-left:3px solid {color};margin-bottom:.5rem;">'
-                                f'<strong>{ev.title}</strong><br>'
-                                f'{ev.start.strftime("%I:%M %p")} – {ev.end.strftime("%I:%M %p")}</div>',
-                                unsafe_allow_html=True)
-            if st.button("✍️ Generate Resolution Email", key=f"ge_{i}",
-                         use_container_width=True, type="primary"):
-                with st.spinner("Generating…"):
-                    slots = st.session_state.assistant.find_free_slots(
-                        st.session_state.calendar_events, cf["event1"].start, duration_minutes=60)
-                    body = st.session_state.assistant.generate_conflict_email(cf, slots)
-                st.text_area("Email:", value=body, height=300, key=f"gn_{i}")
-            st.markdown("---")
-    else:
-        st.markdown('<div class="ok" style="text-align:center;padding:2rem;">'
-                    '<div style="font-size:4rem;">✅</div>'
-                    '<h2 style="color:#00E5A0;">No Conflicts!</h2></div>',
-                    unsafe_allow_html=True)
+        if assistant.conflicts_cache:
+            st.markdown(f"### ⚠️ {len(assistant.conflicts_cache)} Conflict(s) Found")
+            for i, conflict in enumerate(assistant.conflicts_cache):
+                with st.expander(str(conflict)):
+                    st.write(f"**Overlap:** {conflict.overlap_minutes} minutes")
+                    if st.button("Generate Resolution Email", key=f"resolve_{i}"):
+                        with st.spinner("Generating…"):
+                            email_body = assistant.generate_conflict_resolution(conflict)
+                        st.text_area("Draft email", email_body, height=300, key=f"draft_{i}")
 
+                    if st.button("Find Free Slots", key=f"slots_{i}"):
+                        with st.spinner("Scanning calendar…"):
+                            slots = assistant.find_free_slots(
+                                duration_minutes=conflict.event1.duration_minutes,
+                                days_ahead=14,
+                            )
+                        st.write(f"Found {len(slots)} free slots:")
+                        for slot in slots[:5]:
+                            st.write(f"- {slot['start'].strftime('%b %d %I:%M %p')} — {slot['end'].strftime('%I:%M %p')}")
 
-elif st.session_state.current_view == "compose":
-    st.markdown('<h1 class="mhdr">✍️ Compose Email</h1>', unsafe_allow_html=True)
-    re_em = st.session_state.selected_email
-    to_val   = re_em.sender_email  if re_em else ""
-    subj_val = f"Re: {re_em.subject}" if re_em else ""
-    if re_em:
-        st.markdown(f'<div class="ok">📧 Replying to: <strong>{re_em.subject}</strong></div>',
-                    unsafe_allow_html=True)
-    to   = st.text_input("To:",      value=to_val)
-    subj = st.text_input("Subject:", value=subj_val)
-    body = st.text_area("Message:",  height=300)
-    b1,b2,b3,b4 = st.columns(4)
-    with b1:
-        if st.button("📨 Send", use_container_width=True, type="primary"):
-            if not all([to,subj,body]): st.error("Fill all fields.")
+    # ── Ambient agent tab ─────────────────────────────────────────────────────
+    with tab_agent:
+        st.subheader("🤖 Run Ambient Agent")
+        st.write("Fetches emails, analyses them, checks for calendar conflicts, and surfaces suggestions.")
+        if st.button("Run Agent Now", type="primary"):
+            with st.spinner("Running ambient agent…"):
+                result = assistant.run_ambient_agent()
+            if result['status'] == 'success':
+                cols = st.columns(4)
+                cols[0].metric("Emails fetched",   result['emails_fetched'])
+                cols[1].metric("Emails analysed",  result['emails_analyzed'])
+                cols[2].metric("Events fetched",   result['events_fetched'])
+                cols[3].metric("Conflicts found",  result['conflicts_found'])
+                if result['suggestions']:
+                    st.markdown("### 💡 Suggestions")
+                    for s in result['suggestions']:
+                        st.info(s)
             else:
-                with st.spinner("Sending…"):
-                    ok = st.session_state.assistant.send_email(to=to, subject=subj, body=body)
-                if ok: st.success("✅ Sent!"); st.session_state.selected_email=None; time.sleep(1); st.rerun()
-                else: st.error("❌ Failed.")
-    with b2:
-        if st.button("💾 Draft", use_container_width=True):
-            ok = st.session_state.assistant.create_draft(to=to, subject=subj, body=body)
-            st.success("✅ Saved!") if ok else st.error("❌ Failed.")
-    with b3:
-        if st.button("🗑️ Clear", use_container_width=True):
-            st.session_state.selected_email = None; st.rerun()
-    with b4:
-        if st.button("❌ Cancel", use_container_width=True):
-            st.session_state.selected_email = None
-            st.session_state.current_view = "dashboard"; st.rerun()
+                st.error(f"Agent error: {result.get('error')}")
 
 
-elif st.session_state.current_view == "workflow":
-    st.markdown('<h1 class="mhdr">🤖 AI Workflow</h1>', unsafe_allow_html=True)
-    if st.button("🚀 Run Complete AI Workflow", use_container_width=True, type="primary"):
-        r = run_wf()
-        if r:
-            st.success("✅ Done!")
-            for col, v, lbl in zip(st.columns(4),
-                [r.get("emails_fetched",len(st.session_state.emails)),
-                 r.get("events_fetched",len(st.session_state.calendar_events)),
-                 r.get("conflicts_found",len(st.session_state.conflicts)),
-                 len(r.get("suggestions",[]))],
-                ["Emails","Events","Conflicts","Suggestions"]):
-                with col:
-                    st.markdown(f'<div class="card" style="text-align:center;">'
-                                f'<div class="sv">{v}</div><div class="sl">{lbl}</div></div>',
-                                unsafe_allow_html=True)
-
-st.markdown("---")
-st.markdown('<div style="text-align:center;color:#A3A3A3;padding:1rem 0;">'
-            '<small>🔒 Credentials stored only in browser session — never on disk</small></div>',
-            unsafe_allow_html=True)
+if __name__ == "__main__":
+    main()

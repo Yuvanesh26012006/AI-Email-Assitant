@@ -498,7 +498,7 @@ class CalendarService:
         respect_business_start = (start_after is None)
         iterations  = 0
 
-        while cursor < search_end and len(free_slots) < 20 and iterations < 2000:
+        while cursor < search_end and len(free_slots) < 5 and iterations < 2000:
             iterations += 1
 
             # Skip weekends → jump to Monday at business_start (or 00:00 if ignoring floor)
@@ -1056,7 +1056,7 @@ def main():
                                 f"<div style='color:#4ade80;font-size:0.82rem;margin-bottom:8px'>"
                                 f"✅ Found {len(slots)} genuinely free slots (live from Google Calendar):</div>",
                                 unsafe_allow_html=True)
-                            for s in slots[:8]:
+                            for s in slots[:5]:
                                 st.markdown(slot_box(s), unsafe_allow_html=True)
                         else:
                             st.warning("No free slots found in the next 14 days during business hours.")

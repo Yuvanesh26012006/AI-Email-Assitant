@@ -468,29 +468,24 @@ class CalendarService:
         busy_periods.sort(key=lambda x: x[0])
 
         # ── 2. Decide where to start the cursor ───────────────────────
+        # RULE: never show past slots.
+        # If start_after is in the future → start there.
+        # If start_after is in the past (event already happened) → start from NOW.
+        # Either way, always enforce cursor >= now + 15 min buffer.
+        min_start = now + timedelta(minutes=15)
+
         if start_after is not None:
-            # Make timezone-aware if needed
             if start_after.tzinfo is None:
                 start_after = start_after.astimezone()
-            # Start exactly at the conflict-end time, snap up to next 30-min mark
-            cursor = start_after.replace(second=0, microsecond=0)
+            # Use whichever is later: conflict end-time OR right now
+            cursor = max(start_after, min_start).replace(second=0, microsecond=0)
         else:
-            # Default: 15 min from now, snapped to next 30-min mark
-            cursor = now + timedelta(minutes=15)
-            cursor = cursor.replace(second=0, microsecond=0)
+            cursor = min_start.replace(second=0, microsecond=0)
 
-        # Snap cursor up to the next 30-min boundary (e.g. 8:00 → 8:00, 8:05 → 8:30)
+        # Snap up to next 30-min boundary
         mins_over = cursor.minute % 30
         if mins_over:
             cursor += timedelta(minutes=30 - mins_over)
-            cursor = cursor.replace(second=0, microsecond=0)
-
-        # Never search before now
-        if cursor < now:
-            cursor = now + timedelta(minutes=15)
-            mins_over = cursor.minute % 30
-            if mins_over:
-                cursor += timedelta(minutes=30 - mins_over)
             cursor = cursor.replace(second=0, microsecond=0)
 
         # ── 3. Walk forward finding free windows ─────────────────────

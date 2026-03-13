@@ -495,58 +495,61 @@ class CalendarService:
 
         # ── 3. Walk forward finding free windows ─────────────────────
         free_slots = []
-        slot_delta = timedelta(minutes=duration_minutes)
-        step       = timedelta(minutes=30)
-        iterations = 0
+        slot_delta  = timedelta(minutes=duration_minutes)
+        step        = timedelta(minutes=30)
+        # When start_after is given we honour the caller's start point exactly
+        # and do NOT push it forward to business_start.
+        # We only apply business_end so we don't suggest 2am slots.
+        respect_business_start = (start_after is None)
+        iterations  = 0
 
         while cursor < search_end and len(free_slots) < 20 and iterations < 2000:
             iterations += 1
 
-            # Skip weekends → jump to Monday 09:00
+            # Skip weekends → jump to Monday at business_start (or 00:00 if ignoring floor)
             if cursor.weekday() >= 5:
                 days_to_monday = 7 - cursor.weekday()
+                jump_hour = business_start if respect_business_start else cursor.hour
                 cursor = (cursor + timedelta(days=days_to_monday)).replace(
-                    hour=business_start, minute=0, second=0, microsecond=0)
+                    hour=jump_hour, minute=0, second=0, microsecond=0)
                 continue
 
-            # Before business hours → jump to business_start same day
-            if cursor.hour < business_start:
+            # Before business hours → only enforce if no explicit start_after
+            if respect_business_start and cursor.hour < business_start:
                 cursor = cursor.replace(
                     hour=business_start, minute=0, second=0, microsecond=0)
                 continue
 
-            # After business hours → jump to next day business_start
-            if cursor.hour >= business_end or (cursor.hour == business_end and cursor.minute > 0):
+            # After business hours → always skip to next day
+            if cursor.hour >= business_end:
+                next_start = business_start if respect_business_start else 0
                 cursor = (cursor + timedelta(days=1)).replace(
-                    hour=business_start, minute=0, second=0, microsecond=0)
+                    hour=next_start, minute=0, second=0, microsecond=0)
                 continue
 
             slot_end = cursor + slot_delta
 
-            # Slot would overflow end of business day → next day
-            eod = cursor.replace(
-                hour=business_end, minute=0, second=0, microsecond=0)
+            # Slot overflows end-of-day → next day
+            eod = cursor.replace(hour=business_end, minute=0, second=0, microsecond=0)
             if slot_end > eod:
+                next_start = business_start if respect_business_start else 0
                 cursor = (cursor + timedelta(days=1)).replace(
-                    hour=business_start, minute=0, second=0, microsecond=0)
+                    hour=next_start, minute=0, second=0, microsecond=0)
                 continue
 
-            # Check overlap with every busy block.
-            # On any hit, jump cursor to the END of that busy block (skip it entirely).
+            # Check every busy block — if overlap, jump cursor past it and retry
             hit_busy = False
             for bs, be in busy_periods:
-                if cursor < be and slot_end > bs:   # overlap detected
+                if cursor < be and slot_end > bs:
                     hit_busy = True
-                    # Jump to end of this busy block, snapped to next 30-min mark
                     jump = be.replace(second=0, microsecond=0)
                     mins = jump.minute % 30
                     if mins:
                         jump += timedelta(minutes=30 - mins)
                     cursor = jump
-                    break   # re-evaluate from the new cursor position
+                    break  # restart loop with new cursor
 
             if not hit_busy:
-                # Genuinely free — record it and step forward
                 free_slots.append({
                     "start":            cursor,
                     "end":              slot_end,

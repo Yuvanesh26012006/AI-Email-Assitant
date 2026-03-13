@@ -429,17 +429,22 @@ class CalendarService:
                              duration_minutes: int = 60,
                              days_ahead: int = 14,
                              business_start: int = 9,
-                             business_end:   int = 18) -> List[Dict[str, Any]]:
+                             business_end:   int = 18,
+                             start_after: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """
         Query the Calendar freebusy API for exact busy intervals,
-        then walk minute-by-minute to find genuinely free windows.
+        then walk in 30-min steps to find genuinely free windows.
+
+        start_after: if given, begin searching from this moment (e.g. end of
+                     the conflicting event) instead of from right now.
+                     Cursor is snapped to the next clean 30-min boundary.
         Returns list of dicts: {start, end, duration_minutes}.
         """
         if not self.service:
             return []
 
-        now       = datetime.now().astimezone()          # timezone-aware local now
-        search_end= now + timedelta(days=days_ahead)
+        now        = datetime.now().astimezone()
+        search_end = now + timedelta(days=days_ahead)
 
         # ── 1. Pull busy intervals via freebusy API ───────────────────
         try:
@@ -448,84 +453,106 @@ class CalendarService:
                 "timeMax": search_end.isoformat(),
                 "items":   [{"id": "primary"}],
             }).execute()
-            raw_busy = fb.get("calendars",{}).get("primary",{}).get("busy",[])
+            raw_busy = fb.get("calendars", {}).get("primary", {}).get("busy", [])
         except HttpError as e:
             print(f"Freebusy API error: {e}"); raw_busy = []
 
-        # Convert to list of (start_aware, end_aware) tuples
         busy_periods: List[Tuple[datetime, datetime]] = []
         for b in raw_busy:
             try:
-                bs = datetime.fromisoformat(b["start"].replace("Z","+00:00"))
-                be = datetime.fromisoformat(b["end"].replace("Z","+00:00"))
+                bs = datetime.fromisoformat(b["start"].replace("Z", "+00:00"))
+                be = datetime.fromisoformat(b["end"].replace("Z",   "+00:00"))
                 busy_periods.append((bs, be))
             except Exception:
                 continue
-
         busy_periods.sort(key=lambda x: x[0])
 
-        # ── 2. Walk forward in 30-min steps inside business hours ─────
-        free_slots = []
-        slot_delta = timedelta(minutes=duration_minutes)
-        step       = timedelta(minutes=30)
+        # ── 2. Decide where to start the cursor ───────────────────────
+        if start_after is not None:
+            # Make timezone-aware if needed
+            if start_after.tzinfo is None:
+                start_after = start_after.astimezone()
+            # Start exactly at the conflict-end time, snap up to next 30-min mark
+            cursor = start_after.replace(second=0, microsecond=0)
+        else:
+            # Default: 15 min from now, snapped to next 30-min mark
+            cursor = now + timedelta(minutes=15)
+            cursor = cursor.replace(second=0, microsecond=0)
 
-        # Start from next 30-min boundary, minimum 15 min from now
-        cursor = now + timedelta(minutes=15)
+        # Snap cursor up to the next 30-min boundary (e.g. 8:00 → 8:00, 8:05 → 8:30)
         mins_over = cursor.minute % 30
         if mins_over:
             cursor += timedelta(minutes=30 - mins_over)
-        cursor = cursor.replace(second=0, microsecond=0)
+            cursor = cursor.replace(second=0, microsecond=0)
 
+        # Never search before now
+        if cursor < now:
+            cursor = now + timedelta(minutes=15)
+            mins_over = cursor.minute % 30
+            if mins_over:
+                cursor += timedelta(minutes=30 - mins_over)
+            cursor = cursor.replace(second=0, microsecond=0)
+
+        # ── 3. Walk forward finding free windows ─────────────────────
+        free_slots = []
+        slot_delta = timedelta(minutes=duration_minutes)
+        step       = timedelta(minutes=30)
         iterations = 0
+
         while cursor < search_end and len(free_slots) < 20 and iterations < 2000:
             iterations += 1
 
-            # Skip weekends
+            # Skip weekends → jump to Monday 09:00
             if cursor.weekday() >= 5:
-                cursor = (cursor + timedelta(days=1)).replace(
+                days_to_monday = 7 - cursor.weekday()
+                cursor = (cursor + timedelta(days=days_to_monday)).replace(
                     hour=business_start, minute=0, second=0, microsecond=0)
                 continue
 
-            # Skip outside business hours
+            # Before business hours → jump to business_start same day
             if cursor.hour < business_start:
-                cursor = cursor.replace(hour=business_start, minute=0, second=0, microsecond=0)
+                cursor = cursor.replace(
+                    hour=business_start, minute=0, second=0, microsecond=0)
                 continue
-            if cursor.hour >= business_end:
+
+            # After business hours → jump to next day business_start
+            if cursor.hour >= business_end or (cursor.hour == business_end and cursor.minute > 0):
                 cursor = (cursor + timedelta(days=1)).replace(
                     hour=business_start, minute=0, second=0, microsecond=0)
                 continue
 
             slot_end = cursor + slot_delta
 
-            # Would slot overflow end of business day?
-            eod = cursor.replace(hour=business_end, minute=0, second=0, microsecond=0)
+            # Slot would overflow end of business day → next day
+            eod = cursor.replace(
+                hour=business_end, minute=0, second=0, microsecond=0)
             if slot_end > eod:
                 cursor = (cursor + timedelta(days=1)).replace(
                     hour=business_start, minute=0, second=0, microsecond=0)
                 continue
 
-            # Check against every busy period
-            is_free = True
+            # Check overlap with every busy block.
+            # On any hit, jump cursor to the END of that busy block (skip it entirely).
+            hit_busy = False
             for bs, be in busy_periods:
-                if cursor < be and slot_end > bs:   # overlap
-                    is_free = False
-                    # Jump cursor to end of this busy block
-                    if be > cursor:
-                        cursor = be.replace(second=0, microsecond=0)
-                        # round up to next 30-min
-                        mins = cursor.minute % 30
-                        if mins:
-                            cursor += timedelta(minutes=30-mins)
-                    break
+                if cursor < be and slot_end > bs:   # overlap detected
+                    hit_busy = True
+                    # Jump to end of this busy block, snapped to next 30-min mark
+                    jump = be.replace(second=0, microsecond=0)
+                    mins = jump.minute % 30
+                    if mins:
+                        jump += timedelta(minutes=30 - mins)
+                    cursor = jump
+                    break   # re-evaluate from the new cursor position
 
-            if is_free:
+            if not hit_busy:
+                # Genuinely free — record it and step forward
                 free_slots.append({
                     "start":            cursor,
                     "end":              slot_end,
                     "duration_minutes": duration_minutes,
                 })
-                cursor += step          # only advance by step so slots can overlap nicely
-            # (if not free, cursor was already advanced inside the loop above)
+                cursor += step
 
         return free_slots
 
@@ -706,10 +733,15 @@ class EnhancedEmailAssistant:
         self.conflicts_cache = self.calendar.find_conflicts(events or self.events_cache)
         return self.conflicts_cache
 
-    def find_free_slots_live(self, duration_minutes=60, days_ahead=14) -> List[Dict[str,Any]]:
-        """Always hit the live freebusy API — never use cached event list."""
+    def find_free_slots_live(self,
+                             duration_minutes: int = 60,
+                             days_ahead: int = 14,
+                             start_after: Optional[datetime] = None) -> List[Dict[str,Any]]:
+        """Always hit the live freebusy API. start_after = begin search from this datetime."""
         return self.calendar.find_free_slots_live(
-            duration_minutes=duration_minutes, days_ahead=days_ahead
+            duration_minutes=duration_minutes,
+            days_ahead=days_ahead,
+            start_after=start_after,
         )
 
     def generate_conflict_resolution(self,
@@ -1005,12 +1037,16 @@ def main():
                     subj_key    = f"subj_{i}"
                     sent_key    = f"sent_{i}"
 
+                    # Search starts right after the LATER of the two conflicting events
+                    conflict_end = max(cf.event1.end_time, cf.event2.end_time)
+
                     if st.button("🔍 Check Live Calendar for Free Slots",
                                  key=f"fs_{i}", use_container_width=True, type="primary"):
                         with st.spinner("Querying live calendar via freebusy API…"):
                             slots = assistant.find_free_slots_live(
                                 duration_minutes=cf.event1.duration_minutes,
                                 days_ahead=14,
+                                start_after=conflict_end,   # begin right after conflict ends
                             )
                         st.session_state[slot_key] = slots
 

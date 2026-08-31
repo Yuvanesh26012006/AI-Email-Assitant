@@ -903,12 +903,12 @@ def _render_ludiflex_login_screen(auth_url: str):
               <label for="remember-me-checkbox">Remember me</label>
             </div>
             <div class="form-col">
-              <a href="{auth_url}" class="form-link">Forgot password?</a>
+              <a href="{auth_url}" target="_blank" class="form-link">Forgot password?</a>
             </div>
           </div>
 
           <!-- SUBMIT BUTTON -->
-          <a href="{auth_url}" class="form-btn form-btn--submit">
+          <a href="{auth_url}" target="_blank" class="form-btn form-btn--submit">
             Sign In
           </a>
         </div>
@@ -921,7 +921,7 @@ def _render_ludiflex_login_screen(auth_url: str):
         <!-- SOCIALS -->
         <div class="form-bottom">
           <div class="form-socials">
-            <a href="{auth_url}" class="form-btn--google" title="Continue with Google">
+            <a href="{auth_url}" target="_blank" class="form-btn--google" title="Continue with Google">
               <svg class="google-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20">
                 <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"/>
                 <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.33 24 12 24Z"/>
@@ -932,11 +932,12 @@ def _render_ludiflex_login_screen(auth_url: str):
             </a>
           </div>
           <p>
-            Don't have an account? <a href="{auth_url}" class="form-link">Sign up</a>
+            Don't have an account? <a href="{auth_url}" target="_blank" class="form-link">Sign up</a>
           </p>
         </div>
       </div>
     </div>
+    <base target="_blank">
     <script>
       function togglePassword() {{
         const passwordInput = document.getElementById("password");
@@ -953,7 +954,16 @@ def _render_ludiflex_login_screen(auth_url: str):
       }}
     </script>
     """
-    st.markdown(login_html, unsafe_allow_html=True)
+    import streamlit.components.v1 as components
+    st.markdown("""
+    <style>
+    [data-testid="stSidebar"], [data-testid="stHeader"], #MainMenu, footer, [data-testid="stToolbar"] { display: none !important; }
+    .block-container { padding: 0 !important; max-width: 100vw !important; }
+    html, body, [data-testid="stAppViewContainer"], .main { background-color: #f0f0f0 !important; }
+    iframe { border: none !important; width: 100% !important; }
+    </style>
+    """, unsafe_allow_html=True)
+    components.html(login_html, height=750, scrolling=False)
 
 
 def handle_google_auth() -> Optional[Credentials]:

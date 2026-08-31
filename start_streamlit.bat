@@ -9,13 +9,29 @@ echo.
 REM Check Python
 echo Step 1: Checking Python...
 echo ------------------------------------------------
-python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Python not found! Please install Python 3.9+
-    pause
-    exit /b 1
+if exist .venv\Scripts\python.exe (
+    set "PYTHON_CMD=.venv\Scripts\python.exe"
+    set "STREAMLIT_CMD=.venv\Scripts\streamlit.exe"
+    echo [OK] Using virtual environment Python (.venv)
+) else (
+    py -3.11 --version >nul 2>&1
+    if %errorlevel% equ 0 (
+        set "PYTHON_CMD=py -3.11"
+        set "STREAMLIT_CMD=py -3.11 -m streamlit"
+        echo [OK] Python 3.11 found via py launcher
+    ) else (
+        python --version >nul 2>&1
+        if %errorlevel% equ 0 (
+            set "PYTHON_CMD=python"
+            set "STREAMLIT_CMD=streamlit"
+            echo [OK] Python found
+        ) else (
+            echo [ERROR] Python not found! Please install Python 3.9+
+            pause
+            exit /b 1
+        )
+    )
 )
-echo [OK] Python found
 echo.
 
 REM Check files
@@ -53,11 +69,11 @@ set /p install="Install/update dependencies? (y/n): "
 if /i "%install%"=="y" (
     if exist requirements_streamlit.txt (
         echo Installing from requirements_streamlit.txt...
-        pip install -r requirements_streamlit.txt
+        %PYTHON_CMD% -m pip install -r requirements_streamlit.txt
     ) else (
         echo Installing from requirements.txt...
-        pip install -r requirements.txt
-        pip install streamlit streamlit-extras plotly pandas
+        %PYTHON_CMD% -m pip install -r requirements.txt
+        %PYTHON_CMD% -m pip install streamlit streamlit-extras plotly pandas
     )
     echo [OK] Dependencies installed
 ) else (
@@ -138,11 +154,11 @@ if /i "%launch%"=="y" (
     echo.
     echo Launching Streamlit Email Assistant...
     echo.
-    streamlit run streamlit_app.py
+    %STREAMLIT_CMD% run streamlit_app.py
 ) else (
     echo.
     echo You can launch the app anytime with:
-    echo    streamlit run streamlit_app.py
+    echo    %STREAMLIT_CMD% run streamlit_app.py
     echo.
 )
 

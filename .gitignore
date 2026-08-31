@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Environment and Secrets
+.env
+.env.*
+!.env.example
+credentials.json
+token.json
+.streamlit/secrets.toml
+
+# Memory and cache
+memory/*.pkl
+*.log
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

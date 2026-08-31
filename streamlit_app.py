@@ -333,13 +333,24 @@ def _gcfg() -> Optional[dict]:
     }
 
 
+def _get_redirect_uri() -> str:
+    try:
+        if "REDIRECT_URI" in st.secrets:
+            return st.secrets["REDIRECT_URI"]
+        if "APP_URL" in st.secrets:
+            return st.secrets["APP_URL"]
+    except Exception:
+        pass
+    return os.getenv("REDIRECT_URI") or os.getenv("APP_URL") or "http://localhost:8501"
+
+
 def _build_auth_url() -> Optional[str]:
     from urllib.parse import urlencode
     c = _gcfg()
     if not c:
         return None
     return c["auth_uri"] + "?" + urlencode({
-        "client_id": c["client_id"], "redirect_uri": REDIRECT_URI,
+        "client_id": c["client_id"], "redirect_uri": _get_redirect_uri(),
         "response_type": "code", "scope": " ".join(SCOPES),
         "access_type": "offline", "prompt": "consent",
     })
@@ -352,7 +363,7 @@ def _exchange_code(code: str) -> Credentials:
     resp = _requests.post(c["token_uri"], data={
         "code": code, "client_id": c["client_id"],
         "client_secret": c["client_secret"],
-        "redirect_uri": REDIRECT_URI, "grant_type": "authorization_code",
+        "redirect_uri": _get_redirect_uri(), "grant_type": "authorization_code",
     }, timeout=15)
     body = resp.json()
     if not resp.ok or "error" in body:
